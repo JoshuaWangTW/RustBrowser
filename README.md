@@ -12,6 +12,7 @@ RustBrowser 用一條精簡管線解決這件事:
 
 ```
 URL → 輕量 HTTP 抓取(無瀏覽器引擎)
+    → (必要時)headless 補渲染 JS 動態站
     → Readability 萃取正文(移除 nav / 廣告 / footer / script)
     → 轉成精簡 Markdown
     → 輸出給 LLM(token 通常砍掉 75~98%)
@@ -25,15 +26,16 @@ URL → 輕量 HTTP 抓取(無瀏覽器引擎)
 | Rust 官方文件頁 | 8,925 | 154 | **98.3%** |
 | Wikipedia(Rust 條目,重雜訊) | 189,506 | 46,047 | **75.7%** |
 
-Release 執行檔約 **7.6 MB** 單一靜態檔;熱路徑抓取+萃取(含網路)約 **0.5 秒**,**快取命中再快 ~5 倍**。對比 Chrome 動輒數百 MB 記憶體與秒級啟動,這是數量級的差距。
+Release 執行檔約 **8 MB** 單一靜態檔;熱路徑抓取+萃取(含網路)約 **0.5 秒**,**快取命中再快 ~5 倍**。對比 Chrome 動輒數百 MB 記憶體與秒級啟動,這是數量級的差距。
 
 ## 設計目標
 
 | 目標 | 做法 |
 |---|---|
 | **省 token** | 正文萃取 + HTML→Markdown + 空格壓縮,只保留語義內容 |
-| **省硬體** | Rust 無 GC、低記憶體;純 HTTP,不開瀏覽器引擎 |
+| **省硬體** | Rust 無 GC、低記憶體;預設純 HTTP,不開瀏覽器引擎 |
 | **快** | async 並發抓取、rustls 純 Rust TLS、磁碟快取避免重抓 |
+| **抓得到** | 對 JS 動態站,auto 偵測並自動用系統 Chrome headless 補抓 |
 | **可量化** | `--stats` 附帶「原始 vs 輸出 token」對比 |
 
 ## 架構
@@ -48,11 +50,13 @@ Release 執行檔約 **7.6 MB** 單一靜態檔;熱路徑抓取+萃取(含網路
 ├─────────────────────────────────────────────┤
 │  核心 library (src/lib.rs)                     │
 │  distill() 單頁 · distill_many() 並發批次       │
-│  • fetch    HTTP 抓取(reqwest + rustls)        │
-│  • cache    磁碟快取(SHA256 鍵 + TTL)          │
-│  • extract  正文萃取(dom_smoothie / Readability)│
-│  • convert  HTML → Markdown(htmd)+ 空格壓縮     │
-│  • tokens   token 估算與節省統計(tiktoken)      │
+│  • fetch      HTTP 抓取(reqwest + rustls)      │
+│  • cache      磁碟快取(SHA256 鍵 + TTL)        │
+│  • render     headless fallback(系統 Chrome)   │
+│  • extract    正文萃取(dom_smoothie)           │
+│  • convert    HTML → Markdown(htmd)+ 空格壓縮   │
+│  • structured 連結/表格抽成結構化資料           │
+│  • tokens     token 估算與節省統計(tiktoken)   │
 └─────────────────────────────────────────────┘
 ```
 
@@ -62,10 +66,11 @@ Release 執行檔約 **7.6 MB** 單一靜態檔;熱路徑抓取+萃取(含網路
 |---|---|---|
 | `fetch` | `src/fetch.rs` | HTTP 抓取、自動解壓、逾時、重定向、User-Agent |
 | `cache` | `src/cache.rs` | 以 URL 的 SHA256 為鍵,把 fetch 結果存本地,含 TTL |
+| `render` | `src/render.rs` | 偵測 JS 動態站,呼叫系統 Chrome `--dump-dom` 補渲染 |
 | `extract` | `src/extract.rs` | Readability 萃取正文,移除 nav/廣告/footer/script |
 | `convert` | `src/convert.rs` | 乾淨 HTML → 精簡 Markdown,壓縮對齊空格 |
+| `structured` | `src/structured.rs` | 連結(解析相對網址)與表格(headers+rows)抽成資料 |
 | `tokens` | `src/tokens.rs` | 估算原始/輸出 token,回報節省比例 |
-| `cli` | `src/cli.rs` | clap 參數定義 |
 | (lib) | `src/lib.rs` | `distill()` / `distill_many()` 串接整條管線 |
 | MCP | `src/bin/rustbrowser-mcp.rs` | MCP server,暴露 `fetch_url` / `fetch_urls` 工具 |
 
@@ -83,16 +88,27 @@ rustbrowser fetch <url> --format text
 rustbrowser fetch <url> --format json
 rustbrowser fetch <url> --selector "main article"
 
-# 顯示 token 節省統計(印到 stderr)
-rustbrowser fetch <url> --stats
+# 結構化擷取連結 / 表格(搭 --format json 最完整)
+rustbrowser fetch <url> --links --tables --format json
 
-# 快取與並發控制
+# JS 動態站:auto(預設,自動偵測)/ always(強制)/ off(純 HTTP)
+rustbrowser fetch <spa-url> --js always
+
+# token 統計 / 快取與並發控制
+rustbrowser fetch <url> --stats
 rustbrowser fetch <url> --no-cache            # 跳過快取,強制重抓
 rustbrowser fetch <url> --cache-ttl 600       # 快取新鮮度改為 10 分鐘(預設 3600)
 rustbrowser fetch <urls...> --concurrency 4   # 批次並發上限(預設 8)
 ```
 
 磁碟快取存放於系統 cache 目錄下的 `rustbrowser/fetch/`;快取的是**原始 HTML**,所以同一頁之後仍能用不同 selector/format 重新萃取,省下的是最貴的網路往返。
+
+## JS 動態站(headless fallback)
+
+對 React/Vue 或任何「JS 才渲染內容」的站,純 HTTP 抓到的是空殼。`--js auto`(預設)會偵測「萃取文字極少 + 頁面 JS 偏重」,**自動**呼叫系統 Chrome/Edge 的 `--headless --dump-dom` 取得渲染後 DOM —— **零編譯依賴**(不綁瀏覽器引擎),只在必要時才用,保持輕量。
+
+- `--js off` 完全不用 headless;`--js always` 強制每頁都 render。
+- 找不到瀏覽器時可用環境變數 `RUSTBROWSER_CHROME` 指定執行檔路徑。
 
 ## 使用方式:給 Claude Code 用(MCP)
 
@@ -111,7 +127,7 @@ claude mcp add rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowse
 claude mcp add --scope user rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowser-mcp.exe
 ```
 
-共同參數:`format`(markdown/text/json)、`selector`(CSS,僅 `fetch_url`)、`stats`、`timeout_secs`、`no_cache`、`cache_ttl`;`fetch_urls` 另有 `urls`(陣列)與 `concurrency`。
+共同參數:`format`、`selector`、`stats`、`timeout_secs`、`no_cache`、`cache_ttl`、`extract_links`、`extract_tables`、`js`(off/auto/always);`fetch_urls` 另有 `urls` 與 `concurrency`。
 
 ## 從原始碼編譯
 
@@ -127,18 +143,18 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$PWD\.tools\nasm-2.16.03;$env:Path"
 cargo build --release
 ```
 
-產出兩個 binary:`target/release/rustbrowser.exe`(CLI)與 `rustbrowser-mcp.exe`(MCP server)。
+產出兩個 binary:`target/release/rustbrowser.exe`(CLI)與 `rustbrowser-mcp.exe`(MCP server)。headless fallback 直接編入,執行期才需系統 Chrome/Edge。
 
 ## 演進路徑
 
 - ✅ **v0.1(MVP)** — 核心管線 + CLI:抓取 → 萃取 → Markdown → token 統計
 - ✅ **v0.2** — 磁碟快取、批次並發抓取
 - ✅ **v0.3** — MCP server,Claude Code 以原生工具 `fetch_url` / `fetch_urls` 呼叫
-- ⬜ **v0.4** — headless 渲染 fallback(僅針對必須跑 JS 的 SPA),預設關閉
+- ✅ **v0.4** — headless 自動 fallback(auto 偵測 JS 動態站)+ 連結/表格結構化擷取
 
 ## 技術棧
 
-Rust · tokio · reqwest(rustls) · scraper · dom_smoothie · htmd · tiktoken-rs · clap · rmcp · futures
+Rust · tokio · reqwest(rustls) · scraper · dom_smoothie · htmd · tiktoken-rs · clap · rmcp · futures · sha2 · dirs
 
 ---
 

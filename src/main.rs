@@ -27,11 +27,19 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         measure_tokens: args.stats,
         use_cache: !args.no_cache,
         cache_ttl: args.cache_ttl,
+        extract_links: args.links,
+        extract_tables: args.tables,
+        js_mode: match args.js {
+            cli::JsMode::Off => rustbrowser::JsMode::Off,
+            cli::JsMode::Auto => rustbrowser::JsMode::Auto,
+            cli::JsMode::Always => rustbrowser::JsMode::Always,
+        },
     };
 
     if args.urls.len() == 1 {
         let result = distill(&args.urls[0], &opts).await?;
         print_result(&result, args.format);
+        print_extras(&result, args.format);
         print_stats(&result);
     } else {
         run_batch(&args, &opts).await;
@@ -68,6 +76,7 @@ async fn run_batch(args: &FetchArgs, opts: &DistillOptions) {
                 first = false;
                 println!("<!-- {url} -->");
                 print_result(d, args.format);
+                print_extras(d, args.format);
             }
             Err(e) => eprintln!("✗ {url}: {e}"),
         }
@@ -87,6 +96,34 @@ fn print_result(result: &Distilled, format: Format) {
             Ok(s) => println!("{s}"),
             Err(e) => eprintln!("JSON output failed: {e}"),
         },
+    }
+}
+
+/// In non-JSON output, append structured links/tables as readable Markdown.
+/// (JSON already carries them in the serialised result.)
+fn print_extras(result: &Distilled, format: Format) {
+    if matches!(format, Format::Json) {
+        return;
+    }
+    if let Some(links) = &result.links {
+        println!("\n## Links ({})\n", links.len());
+        for l in links {
+            let label = if l.text.is_empty() { &l.href } else { &l.text };
+            println!("- [{label}]({})", l.href);
+        }
+    }
+    if let Some(tables) = &result.tables {
+        for (i, t) in tables.iter().enumerate() {
+            println!("\n## Table {}\n", i + 1);
+            if !t.headers.is_empty() {
+                println!("| {} |", t.headers.join(" | "));
+                let sep: Vec<&str> = t.headers.iter().map(|_| "---").collect();
+                println!("| {} |", sep.join(" | "));
+            }
+            for row in &t.rows {
+                println!("| {} |", row.join(" | "));
+            }
+        }
     }
 }
 

@@ -18,7 +18,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
-use rustbrowser::{DistillOptions, Distilled, distill, distill_many};
+use rustbrowser::{DistillOptions, Distilled, JsMode, distill, distill_many};
 
 #[derive(Debug, Clone)]
 struct RustBrowserServer {
@@ -59,6 +59,15 @@ struct FetchParams {
     /// Cache freshness window in seconds (default 3600).
     #[serde(default)]
     cache_ttl: Option<u64>,
+    /// Also extract all links from the main content as structured data.
+    #[serde(default)]
+    extract_links: Option<bool>,
+    /// Also extract all tables from the main content as structured data.
+    #[serde(default)]
+    extract_tables: Option<bool>,
+    /// Headless JS rendering: "off", "auto" (default), or "always".
+    #[serde(default)]
+    js: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -83,15 +92,36 @@ struct FetchManyParams {
     /// Max concurrent requests (default 8).
     #[serde(default)]
     concurrency: Option<usize>,
+    /// Also extract all links from each page's main content.
+    #[serde(default)]
+    extract_links: Option<bool>,
+    /// Also extract all tables from each page's main content.
+    #[serde(default)]
+    extract_tables: Option<bool>,
+    /// Headless JS rendering: "off", "auto" (default), or "always".
+    #[serde(default)]
+    js: Option<String>,
+}
+
+fn parse_js_mode(js: Option<&str>) -> JsMode {
+    match js {
+        Some("off") => JsMode::Off,
+        Some("always") => JsMode::Always,
+        _ => JsMode::Auto,
+    }
 }
 
 /// Build pipeline options from optional MCP parameters.
+#[allow(clippy::too_many_arguments)]
 fn opts_from(
     timeout_secs: Option<u64>,
     selector: Option<String>,
     stats: Option<bool>,
     no_cache: Option<bool>,
     cache_ttl: Option<u64>,
+    links: Option<bool>,
+    tables: Option<bool>,
+    js: Option<&str>,
 ) -> DistillOptions {
     DistillOptions {
         timeout: Duration::from_secs(timeout_secs.unwrap_or(20)),
@@ -100,50 +130,89 @@ fn opts_from(
         measure_tokens: stats.unwrap_or(false),
         use_cache: !no_cache.unwrap_or(false),
         cache_ttl: cache_ttl.unwrap_or(3600),
+        extract_links: links.unwrap_or(false),
+        extract_tables: tables.unwrap_or(false),
+        js_mode: parse_js_mode(js),
     }
 }
 
-/// Render one distilled page in the requested format, optionally with stats.
-fn render(result: &Distilled, fmt: &str, stats: bool) -> Result<String, rmcp::ErrorData> {
-    let body = match fmt {
-        "json" => serde_json::to_string_pretty(result)
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
-        "text" => result.text.clone(),
-        _ => {
-            let mut s = String::new();
-            if !result.title.is_empty() {
-                s.push_str(&format!("# {}\n\n", result.title));
-            }
-            s.push_str(&result.markdown);
-            s
+/// Render one distilled page in the requested format. Links/tables and stats
+/// (when present) are appended for the human-readable formats; JSON carries
+/// everything in the serialised result already.
+fn render(result: &Distilled, fmt: &str) -> Result<String, rmcp::ErrorData> {
+    if fmt == "json" {
+        return serde_json::to_string_pretty(result)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
+    }
+
+    let mut out = if fmt == "text" {
+        result.text.clone()
+    } else {
+        let mut s = String::new();
+        if !result.title.is_empty() {
+            s.push_str(&format!("# {}\n\n", result.title));
         }
+        s.push_str(&result.markdown);
+        s
     };
-    Ok(match (stats, &result.stats) {
-        (true, Some(st)) => format!(
-            "{body}\n\n---\n_token stats: raw {} → output {} ({:.1}% saved)_",
+
+    if let Some(links) = &result.links {
+        out.push_str(&format!("\n\n## Links ({})\n", links.len()));
+        for l in links {
+            let label = if l.text.is_empty() { &l.href } else { &l.text };
+            out.push_str(&format!("\n- [{label}]({})", l.href));
+        }
+    }
+    if let Some(tables) = &result.tables {
+        for (i, t) in tables.iter().enumerate() {
+            out.push_str(&format!("\n\n## Table {}\n\n", i + 1));
+            if !t.headers.is_empty() {
+                out.push_str(&format!("| {} |\n", t.headers.join(" | ")));
+                let sep: Vec<&str> = t.headers.iter().map(|_| "---").collect();
+                out.push_str(&format!("| {} |\n", sep.join(" | ")));
+            }
+            for row in &t.rows {
+                out.push_str(&format!("| {} |\n", row.join(" | ")));
+            }
+        }
+    }
+
+    if let Some(st) = &result.stats {
+        out.push_str(&format!(
+            "\n\n---\n_token stats: raw {} → output {} ({:.1}% saved)_",
             st.raw_tokens,
             st.output_tokens,
             st.saved_ratio * 100.0
-        ),
-        _ => body,
-    })
+        ));
+    }
+
+    Ok(out)
 }
 
 #[tool_router]
 impl RustBrowserServer {
     #[tool(
-        description = "Fetch a web page and return its MAIN CONTENT distilled to clean Markdown — navigation, ads, scripts, and boilerplate stripped out. Use this instead of fetching raw HTML whenever you need to read web content: it typically costs 75-98% fewer tokens than the raw page. Results are cached on disk for repeat fetches. Optionally target a CSS selector or request plain text / JSON."
+        description = "Fetch a web page and return its MAIN CONTENT distilled to clean Markdown — navigation, ads, scripts, and boilerplate stripped out. Use this instead of fetching raw HTML whenever you need to read web content: it typically costs 75-98% fewer tokens than the raw page. Results are cached on disk for repeat fetches; JS-heavy pages are auto-rendered via headless Chrome. Optionally target a CSS selector, extract links/tables as structured data, or request plain text / JSON."
     )]
     async fn fetch_url(
         &self,
         Parameters(p): Parameters<FetchParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let opts = opts_from(p.timeout_secs, p.selector, p.stats, p.no_cache, p.cache_ttl);
+        let opts = opts_from(
+            p.timeout_secs,
+            p.selector,
+            p.stats,
+            p.no_cache,
+            p.cache_ttl,
+            p.extract_links,
+            p.extract_tables,
+            p.js.as_deref(),
+        );
         let result = distill(&p.url, &opts)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("fetch failed: {e}"), None))?;
         let fmt = p.format.as_deref().unwrap_or("markdown");
-        render(&result, fmt, p.stats.unwrap_or(false))
+        render(&result, fmt)
     }
 
     #[tool(
@@ -153,7 +222,16 @@ impl RustBrowserServer {
         &self,
         Parameters(p): Parameters<FetchManyParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let opts = opts_from(p.timeout_secs, None, p.stats, p.no_cache, p.cache_ttl);
+        let opts = opts_from(
+            p.timeout_secs,
+            None,
+            p.stats,
+            p.no_cache,
+            p.cache_ttl,
+            p.extract_links,
+            p.extract_tables,
+            p.js.as_deref(),
+        );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");
 
@@ -169,7 +247,6 @@ impl RustBrowserServer {
                 .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
         }
 
-        let stats = p.stats.unwrap_or(false);
         let mut out = String::new();
         for (i, (url, r)) in results.iter().enumerate() {
             if i > 0 {
@@ -178,7 +255,7 @@ impl RustBrowserServer {
             match r {
                 Ok(d) => {
                     out.push_str(&format!("<!-- {url} -->\n"));
-                    out.push_str(&render(d, fmt, stats)?);
+                    out.push_str(&render(d, fmt)?);
                 }
                 Err(e) => out.push_str(&format!("✗ {url}: {e}")),
             }
@@ -193,7 +270,8 @@ impl ServerHandler for RustBrowserServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "RustBrowser: token-lean web fetching. fetch_url distills one page; fetch_urls \
              fetches many concurrently. Both return clean Markdown instead of raw HTML, saving \
-             75-98% of tokens, with an on-disk cache for repeat fetches.",
+             75-98% of tokens, with an on-disk cache and automatic headless rendering for \
+             JS-heavy pages.",
         )
     }
 }

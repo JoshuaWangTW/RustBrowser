@@ -8,6 +8,8 @@ pub mod cache;
 pub mod convert;
 pub mod extract;
 pub mod fetch;
+pub mod render;
+pub mod structured;
 pub mod tokens;
 
 use std::time::Duration;
@@ -19,7 +21,20 @@ use serde::Serialize;
 
 use crate::cache::CachedFetch;
 use crate::fetch::{FetchOptions, FetchResult};
+use crate::structured::{Link, Table};
 use crate::tokens::TokenStats;
+
+/// When (if ever) to fall back to headless rendering of JavaScript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JsMode {
+    /// Never render with a headless browser.
+    Off,
+    /// Render only when the page looks like an unrendered JS app. (default)
+    #[default]
+    Auto,
+    /// Always render with a headless browser.
+    Always,
+}
 
 /// Options controlling a single distillation.
 #[derive(Debug, Clone)]
@@ -35,6 +50,12 @@ pub struct DistillOptions {
     pub use_cache: bool,
     /// Cache freshness window in seconds; older entries are re-fetched.
     pub cache_ttl: u64,
+    /// Also extract all links as structured data into `Distilled.links`.
+    pub extract_links: bool,
+    /// Also extract all tables as structured data into `Distilled.tables`.
+    pub extract_tables: bool,
+    /// Headless JS-rendering fallback policy.
+    pub js_mode: JsMode,
 }
 
 impl Default for DistillOptions {
@@ -46,6 +67,9 @@ impl Default for DistillOptions {
             measure_tokens: false,
             use_cache: true,
             cache_ttl: 3600,
+            extract_links: false,
+            extract_tables: false,
+            js_mode: JsMode::Auto,
         }
     }
 }
@@ -76,25 +100,64 @@ pub struct Distilled {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats: Option<Stats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Link>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<Vec<Table>>,
+}
+
+/// Intermediate extracted content, before Markdown conversion.
+struct Content {
+    title: String,
+    byline: Option<String>,
+    excerpt: Option<String>,
+    content_html: String,
+    text: String,
 }
 
 /// Run the full pipeline for a single URL.
 pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
-    let fetched = fetch_maybe_cached(url, opts).await?;
+    let mut fetched = fetch_maybe_cached(url, opts).await?;
+    let mut content = extract_content(&fetched, opts)?;
 
-    // Either pluck a specific CSS selector, or run full readability extraction.
-    let (title, byline, excerpt, content_html, mut text) = if let Some(sel) = &opts.selector {
-        let html = select_html(&fetched.html, sel)?;
-        (String::new(), None, None, html, String::new())
-    } else {
-        let ex = extract::extract(&fetched.html, &fetched.final_url)?;
-        (ex.title, ex.byline, ex.excerpt, ex.content_html, ex.text)
+    // Headless fallback: re-fetch via a real browser when the HTTP HTML looks
+    // like an unrendered JS app (or when always/never is forced). Failures here
+    // are non-fatal — we keep the HTTP result.
+    let needs_js = match opts.js_mode {
+        JsMode::Off => false,
+        JsMode::Always => true,
+        JsMode::Auto => {
+            // Count visible (non-whitespace) characters: readability's text is
+            // padded with lots of layout whitespace that would otherwise mask
+            // an empty, JS-rendered page as if it had real content.
+            let visible: usize = content.text.split_whitespace().map(str::len).sum();
+            opts.selector.is_none()
+                && visible < render::JS_TEXT_THRESHOLD
+                && render::looks_like_js_app(&fetched.html)
+        }
     };
-
-    let markdown = convert::to_markdown(&content_html)?;
-    if text.is_empty() {
-        text = markdown.clone();
+    if needs_js && let Ok(rendered) = render::render_html(&fetched.final_url, opts.timeout).await {
+        fetched.raw_bytes = rendered.len();
+        fetched.html = rendered;
+        content = extract_content(&fetched, opts)?;
     }
+
+    let markdown = convert::to_markdown(&content.content_html)?;
+
+    // Structured extraction runs against the distilled content, so links and
+    // tables reflect the main body rather than page-wide navigation chrome.
+    let links = opts
+        .extract_links
+        .then(|| structured::extract_links(&content.content_html, &fetched.final_url));
+    let tables = opts
+        .extract_tables
+        .then(|| structured::extract_tables(&content.content_html));
+
+    let text = if content.text.is_empty() {
+        markdown.clone()
+    } else {
+        content.text
+    };
 
     let stats = if opts.measure_tokens {
         let ts = TokenStats::measure(&fetched.html, &markdown);
@@ -112,13 +175,38 @@ pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
     Ok(Distilled {
         final_url: fetched.final_url,
         status: fetched.status,
-        title,
-        byline,
-        excerpt,
+        title: content.title,
+        byline: content.byline,
+        excerpt: content.excerpt,
         markdown,
         text,
         stats,
+        links,
+        tables,
     })
+}
+
+/// Run readability (or a CSS selector) over a fetched page.
+fn extract_content(fetched: &FetchResult, opts: &DistillOptions) -> Result<Content> {
+    if let Some(sel) = &opts.selector {
+        let html = select_html(&fetched.html, sel)?;
+        Ok(Content {
+            title: String::new(),
+            byline: None,
+            excerpt: None,
+            content_html: html,
+            text: String::new(),
+        })
+    } else {
+        let ex = extract::extract(&fetched.html, &fetched.final_url)?;
+        Ok(Content {
+            title: ex.title,
+            byline: ex.byline,
+            excerpt: ex.excerpt,
+            content_html: ex.content_html,
+            text: ex.text,
+        })
+    }
 }
 
 /// Distill many URLs concurrently, preserving input order in the results.

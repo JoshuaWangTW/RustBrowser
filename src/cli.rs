@@ -53,6 +53,18 @@ pub struct FetchArgs {
     /// Max concurrent requests when fetching multiple URLs.
     #[arg(long, default_value_t = 8)]
     pub concurrency: usize,
+
+    /// Also extract all links from the main content as structured data.
+    #[arg(long)]
+    pub links: bool,
+
+    /// Also extract all tables from the main content as structured data.
+    #[arg(long)]
+    pub tables: bool,
+
+    /// Headless JS-rendering fallback: off, auto (default), or always.
+    #[arg(long, value_enum, default_value_t = JsMode::Auto)]
+    pub js: JsMode,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -63,4 +75,15 @@ pub enum Format {
     Text,
     /// Structured JSON (metadata + markdown + stats).
     Json,
+}
+
+/// Headless JS-rendering policy.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum JsMode {
+    /// Never use headless rendering.
+    Off,
+    /// Auto-detect unrendered JS apps and render only those (default).
+    Auto,
+    /// Always render with a headless browser.
+    Always,
 }
