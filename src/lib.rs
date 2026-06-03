@@ -54,6 +54,9 @@ pub struct DistillOptions {
     pub extract_links: bool,
     /// Also extract all tables as structured data into `Distilled.tables`.
     pub extract_tables: bool,
+    /// When extracting links, pull from the whole page (incl. nav/footer)
+    /// rather than just the distilled main content. Useful for crawling.
+    pub links_full: bool,
     /// Headless JS-rendering fallback policy.
     pub js_mode: JsMode,
 }
@@ -69,6 +72,7 @@ impl Default for DistillOptions {
             cache_ttl: 3600,
             extract_links: false,
             extract_tables: false,
+            links_full: false,
             js_mode: JsMode::Auto,
         }
     }
@@ -146,9 +150,15 @@ pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
 
     // Structured extraction runs against the distilled content, so links and
     // tables reflect the main body rather than page-wide navigation chrome.
-    let links = opts
-        .extract_links
-        .then(|| structured::extract_links(&content.content_html, &fetched.final_url));
+    let links = opts.extract_links.then(|| {
+        // Whole-page links (incl. nav) for crawling, or just the main content.
+        let scope = if opts.links_full {
+            &fetched.html
+        } else {
+            &content.content_html
+        };
+        structured::extract_links(scope, &fetched.final_url)
+    });
     let tables = opts
         .extract_tables
         .then(|| structured::extract_tables(&content.content_html));

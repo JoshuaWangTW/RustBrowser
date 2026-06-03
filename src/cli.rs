@@ -58,6 +58,10 @@ pub struct FetchArgs {
     #[arg(long)]
     pub links: bool,
 
+    /// Extract ALL links including nav/footer (whole page) — for crawling.
+    #[arg(long)]
+    pub links_all: bool,
+
     /// Also extract all tables from the main content as structured data.
     #[arg(long)]
     pub tables: bool,

@@ -65,6 +65,9 @@ struct FetchParams {
     /// Also extract all tables from the main content as structured data.
     #[serde(default)]
     extract_tables: Option<bool>,
+    /// Extract ALL links incl. nav/footer (whole page) instead of main content.
+    #[serde(default)]
+    links_full: Option<bool>,
     /// Headless JS rendering: "off", "auto" (default), or "always".
     #[serde(default)]
     js: Option<String>,
@@ -98,6 +101,9 @@ struct FetchManyParams {
     /// Also extract all tables from each page's main content.
     #[serde(default)]
     extract_tables: Option<bool>,
+    /// Extract ALL links incl. nav/footer (whole page) instead of main content.
+    #[serde(default)]
+    links_full: Option<bool>,
     /// Headless JS rendering: "off", "auto" (default), or "always".
     #[serde(default)]
     js: Option<String>,
@@ -121,8 +127,10 @@ fn opts_from(
     cache_ttl: Option<u64>,
     links: Option<bool>,
     tables: Option<bool>,
+    links_full: Option<bool>,
     js: Option<&str>,
 ) -> DistillOptions {
+    let links_full = links_full.unwrap_or(false);
     DistillOptions {
         timeout: Duration::from_secs(timeout_secs.unwrap_or(20)),
         user_agent: None,
@@ -130,8 +138,9 @@ fn opts_from(
         measure_tokens: stats.unwrap_or(false),
         use_cache: !no_cache.unwrap_or(false),
         cache_ttl: cache_ttl.unwrap_or(3600),
-        extract_links: links.unwrap_or(false),
+        extract_links: links.unwrap_or(false) || links_full,
         extract_tables: tables.unwrap_or(false),
+        links_full,
         js_mode: parse_js_mode(js),
     }
 }
@@ -206,6 +215,7 @@ impl RustBrowserServer {
             p.cache_ttl,
             p.extract_links,
             p.extract_tables,
+            p.links_full,
             p.js.as_deref(),
         );
         let result = distill(&p.url, &opts)
@@ -230,6 +240,7 @@ impl RustBrowserServer {
             p.cache_ttl,
             p.extract_links,
             p.extract_tables,
+            p.links_full,
             p.js.as_deref(),
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;

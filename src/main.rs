@@ -27,8 +27,9 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         measure_tokens: args.stats,
         use_cache: !args.no_cache,
         cache_ttl: args.cache_ttl,
-        extract_links: args.links,
+        extract_links: args.links || args.links_all,
         extract_tables: args.tables,
+        links_full: args.links_all,
         js_mode: match args.js {
             cli::JsMode::Off => rustbrowser::JsMode::Off,
             cli::JsMode::Auto => rustbrowser::JsMode::Auto,
