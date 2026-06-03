@@ -1,0 +1,13 @@
+/target
+
+# Local toolchain helpers (portable NASM for ring, etc.)
+/.tools
+
+# Machine-local config (absolute paths / restricted-network workarounds).
+# See the matching *.example files for templates.
+/.mcp.json
+/.cargo/config.toml
+
+# Ad-hoc test artefacts
+/out*.md
+/stats*.txt

@@ -1,0 +1,9 @@
+# Copy this to `.cargo/config.toml` ONLY on a restricted network where schannel
+# cannot reach TLS certificate revocation servers (error CRYPT_E_NO_REVOCATION_CHECK),
+# which otherwise blocks cargo from downloading crates from crates.io.
+#
+# This relaxes only "treat an unreachable revocation server as fatal". The
+# certificate chain, expiry, and hostname are still verified, and every crate is
+# checksum-verified (SHA256) via Cargo.lock — so tampering is still rejected.
+[http]
+check-revoke = false

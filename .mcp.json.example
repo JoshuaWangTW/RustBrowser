@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rustbrowser": {
+      "command": "/absolute/path/to/RustBrowser/target/release/rustbrowser-mcp",
+      "args": []
+    }
+  }
+}
