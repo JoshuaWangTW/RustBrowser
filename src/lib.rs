@@ -4,6 +4,7 @@
 //! CLI today and an MCP server tomorrow. The whole point is to turn a heavy
 //! HTML page into the minimal token footprint an LLM actually needs.
 
+pub mod cache;
 pub mod convert;
 pub mod extract;
 pub mod fetch;
@@ -12,10 +13,12 @@ pub mod tokens;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use futures::stream::{self, StreamExt};
 use scraper::{Html, Selector};
 use serde::Serialize;
 
-use crate::fetch::FetchOptions;
+use crate::cache::CachedFetch;
+use crate::fetch::{FetchOptions, FetchResult};
 use crate::tokens::TokenStats;
 
 /// Options controlling a single distillation.
@@ -28,6 +31,10 @@ pub struct DistillOptions {
     pub selector: Option<String>,
     /// Whether to compute token-savings statistics (adds a little work).
     pub measure_tokens: bool,
+    /// Use the on-disk fetch cache (read fresh entries, write new ones).
+    pub use_cache: bool,
+    /// Cache freshness window in seconds; older entries are re-fetched.
+    pub cache_ttl: u64,
 }
 
 impl Default for DistillOptions {
@@ -37,6 +44,8 @@ impl Default for DistillOptions {
             user_agent: None,
             selector: None,
             measure_tokens: false,
+            use_cache: true,
+            cache_ttl: 3600,
         }
     }
 }
@@ -71,15 +80,7 @@ pub struct Distilled {
 
 /// Run the full pipeline for a single URL.
 pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
-    let mut fopts = FetchOptions {
-        timeout: opts.timeout,
-        ..Default::default()
-    };
-    if let Some(ua) = &opts.user_agent {
-        fopts.user_agent = ua.clone();
-    }
-
-    let fetched = fetch::fetch(url, &fopts).await?;
+    let fetched = fetch_maybe_cached(url, opts).await?;
 
     // Either pluck a specific CSS selector, or run full readability extraction.
     let (title, byline, excerpt, content_html, mut text) = if let Some(sel) = &opts.selector {
@@ -118,6 +119,69 @@ pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
         text,
         stats,
     })
+}
+
+/// Distill many URLs concurrently, preserving input order in the results.
+///
+/// `concurrency` caps how many requests are in flight at once — polite to
+/// servers and avoids opening hundreds of sockets at once.
+pub async fn distill_many(
+    urls: &[String],
+    opts: &DistillOptions,
+    concurrency: usize,
+) -> Vec<(String, Result<Distilled>)> {
+    stream::iter(urls.iter().cloned())
+        .map(|url| async move {
+            let result = distill(&url, opts).await;
+            (url, result)
+        })
+        .buffered(concurrency.max(1))
+        .collect()
+        .await
+}
+
+/// Fetch a URL, consulting and populating the on-disk cache when enabled.
+/// Cache writes are best-effort: a failure to cache is not a failure to fetch.
+async fn fetch_maybe_cached(url: &str, opts: &DistillOptions) -> Result<FetchResult> {
+    let cached = if opts.use_cache {
+        cache::get(url, opts.cache_ttl)
+    } else {
+        None
+    };
+    if let Some(c) = cached {
+        return Ok(FetchResult {
+            final_url: c.final_url,
+            status: c.status,
+            content_type: c.content_type,
+            html: c.html,
+            raw_bytes: c.raw_bytes,
+        });
+    }
+
+    let mut fopts = FetchOptions {
+        timeout: opts.timeout,
+        ..Default::default()
+    };
+    if let Some(ua) = &opts.user_agent {
+        fopts.user_agent = ua.clone();
+    }
+    let fetched = fetch::fetch(url, &fopts).await?;
+
+    if opts.use_cache {
+        let _ = cache::put(
+            url,
+            &CachedFetch {
+                fetched_at: cache::now(),
+                final_url: fetched.final_url.clone(),
+                status: fetched.status,
+                content_type: fetched.content_type.clone(),
+                html: fetched.html.clone(),
+                raw_bytes: fetched.raw_bytes,
+            },
+        );
+    }
+
+    Ok(fetched)
 }
 
 /// Extract the outer HTML of every element matching a CSS selector.

@@ -1,6 +1,6 @@
-//! RustBrowser MCP server — exposes the distillation pipeline as an MCP tool
-//! so Claude Code can fetch web content natively, without raw HTML ever
-//! entering the conversation. This is where the token savings really land.
+//! RustBrowser MCP server — exposes the distillation pipeline as MCP tools so
+//! Claude Code can fetch web content natively, without raw HTML ever entering
+//! the conversation. This is where the token savings really land.
 //!
 //! Transport is stdio: the MCP protocol speaks over stdout, so NOTHING may be
 //! printed to stdout except protocol frames. All diagnostics go to stderr.
@@ -16,8 +16,9 @@ use rmcp::{
     transport::stdio,
 };
 use serde::Deserialize;
+use serde_json::json;
 
-use rustbrowser::{DistillOptions, distill};
+use rustbrowser::{DistillOptions, Distilled, distill, distill_many};
 
 #[derive(Debug, Clone)]
 struct RustBrowserServer {
@@ -52,53 +53,136 @@ struct FetchParams {
     /// Request timeout in seconds (default 20).
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Skip the on-disk cache and always fetch fresh.
+    #[serde(default)]
+    no_cache: Option<bool>,
+    /// Cache freshness window in seconds (default 3600).
+    #[serde(default)]
+    cache_ttl: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FetchManyParams {
+    /// The URLs to fetch — fetched concurrently.
+    urls: Vec<String>,
+    /// Output format: "markdown" (default), "text", or "json".
+    #[serde(default)]
+    format: Option<String>,
+    /// Append token-savings stats to each page.
+    #[serde(default)]
+    stats: Option<bool>,
+    /// Request timeout in seconds (default 20).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Skip the on-disk cache and always fetch fresh.
+    #[serde(default)]
+    no_cache: Option<bool>,
+    /// Cache freshness window in seconds (default 3600).
+    #[serde(default)]
+    cache_ttl: Option<u64>,
+    /// Max concurrent requests (default 8).
+    #[serde(default)]
+    concurrency: Option<usize>,
+}
+
+/// Build pipeline options from optional MCP parameters.
+fn opts_from(
+    timeout_secs: Option<u64>,
+    selector: Option<String>,
+    stats: Option<bool>,
+    no_cache: Option<bool>,
+    cache_ttl: Option<u64>,
+) -> DistillOptions {
+    DistillOptions {
+        timeout: Duration::from_secs(timeout_secs.unwrap_or(20)),
+        user_agent: None,
+        selector,
+        measure_tokens: stats.unwrap_or(false),
+        use_cache: !no_cache.unwrap_or(false),
+        cache_ttl: cache_ttl.unwrap_or(3600),
+    }
+}
+
+/// Render one distilled page in the requested format, optionally with stats.
+fn render(result: &Distilled, fmt: &str, stats: bool) -> Result<String, rmcp::ErrorData> {
+    let body = match fmt {
+        "json" => serde_json::to_string_pretty(result)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
+        "text" => result.text.clone(),
+        _ => {
+            let mut s = String::new();
+            if !result.title.is_empty() {
+                s.push_str(&format!("# {}\n\n", result.title));
+            }
+            s.push_str(&result.markdown);
+            s
+        }
+    };
+    Ok(match (stats, &result.stats) {
+        (true, Some(st)) => format!(
+            "{body}\n\n---\n_token stats: raw {} → output {} ({:.1}% saved)_",
+            st.raw_tokens,
+            st.output_tokens,
+            st.saved_ratio * 100.0
+        ),
+        _ => body,
+    })
 }
 
 #[tool_router]
 impl RustBrowserServer {
     #[tool(
-        description = "Fetch a web page and return its MAIN CONTENT distilled to clean Markdown — navigation, ads, scripts, and boilerplate stripped out. Use this instead of fetching raw HTML whenever you need to read web content: it typically costs 75-98% fewer tokens than the raw page. Optionally target a CSS selector or request plain text / JSON."
+        description = "Fetch a web page and return its MAIN CONTENT distilled to clean Markdown — navigation, ads, scripts, and boilerplate stripped out. Use this instead of fetching raw HTML whenever you need to read web content: it typically costs 75-98% fewer tokens than the raw page. Results are cached on disk for repeat fetches. Optionally target a CSS selector or request plain text / JSON."
     )]
     async fn fetch_url(
         &self,
         Parameters(p): Parameters<FetchParams>,
     ) -> Result<String, rmcp::ErrorData> {
-        let opts = DistillOptions {
-            timeout: Duration::from_secs(p.timeout_secs.unwrap_or(20)),
-            user_agent: None,
-            selector: p.selector,
-            measure_tokens: p.stats.unwrap_or(false),
-        };
-
+        let opts = opts_from(p.timeout_secs, p.selector, p.stats, p.no_cache, p.cache_ttl);
         let result = distill(&p.url, &opts)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("fetch failed: {e}"), None))?;
-
         let fmt = p.format.as_deref().unwrap_or("markdown");
-        let body = match fmt {
-            "json" => serde_json::to_string_pretty(&result)
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?,
-            "text" => result.text.clone(),
-            _ => {
-                let mut s = String::new();
-                if !result.title.is_empty() {
-                    s.push_str(&format!("# {}\n\n", result.title));
-                }
-                s.push_str(&result.markdown);
-                s
+        render(&result, fmt, p.stats.unwrap_or(false))
+    }
+
+    #[tool(
+        description = "Fetch MULTIPLE web pages concurrently and return all distilled contents at once. Use this when you need several pages in one go — far faster than calling fetch_url repeatedly, and still token-lean. Pages are separated by a divider; pass format=json for a structured array."
+    )]
+    async fn fetch_urls(
+        &self,
+        Parameters(p): Parameters<FetchManyParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let opts = opts_from(p.timeout_secs, None, p.stats, p.no_cache, p.cache_ttl);
+        let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
+        let fmt = p.format.as_deref().unwrap_or("markdown");
+
+        if fmt == "json" {
+            let arr: Vec<_> = results
+                .iter()
+                .map(|(url, r)| match r {
+                    Ok(d) => json!({ "url": url, "ok": true, "result": d }),
+                    Err(e) => json!({ "url": url, "ok": false, "error": e.to_string() }),
+                })
+                .collect();
+            return serde_json::to_string_pretty(&arr)
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
+        }
+
+        let stats = p.stats.unwrap_or(false);
+        let mut out = String::new();
+        for (i, (url, r)) in results.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n\n═══════════════════════════════\n\n");
             }
-        };
-
-        let out = match (p.stats.unwrap_or(false), &result.stats) {
-            (true, Some(st)) => format!(
-                "{body}\n\n---\n_token stats: raw {} → output {} ({:.1}% saved)_",
-                st.raw_tokens,
-                st.output_tokens,
-                st.saved_ratio * 100.0
-            ),
-            _ => body,
-        };
-
+            match r {
+                Ok(d) => {
+                    out.push_str(&format!("<!-- {url} -->\n"));
+                    out.push_str(&render(d, fmt, stats)?);
+                }
+                Err(e) => out.push_str(&format!("✗ {url}: {e}")),
+            }
+        }
         Ok(out)
     }
 }
@@ -107,9 +191,9 @@ impl RustBrowserServer {
 impl ServerHandler for RustBrowserServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "RustBrowser: token-lean web fetching. The fetch_url tool returns distilled \
-                 main content (clean Markdown) instead of heavy raw HTML, saving 75-98% of \
-                 tokens. Prefer it over fetching raw pages.",
+            "RustBrowser: token-lean web fetching. fetch_url distills one page; fetch_urls \
+             fetches many concurrently. Both return clean Markdown instead of raw HTML, saving \
+             75-98% of tokens, with an on-disk cache for repeat fetches.",
         )
     }
 }

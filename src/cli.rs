@@ -16,14 +16,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Fetch a URL and output its distilled content.
+    /// Fetch one or more URLs and output distilled content.
     Fetch(FetchArgs),
 }
 
 #[derive(Args)]
 pub struct FetchArgs {
-    /// URL to fetch.
-    pub url: String,
+    /// One or more URLs. Multiple URLs are fetched concurrently as a batch.
+    #[arg(required = true)]
+    pub urls: Vec<String>,
 
     /// Output format.
     #[arg(short, long, value_enum, default_value_t = Format::Markdown)]
@@ -40,6 +41,18 @@ pub struct FetchArgs {
     /// Request timeout in seconds.
     #[arg(long, default_value_t = 20)]
     pub timeout: u64,
+
+    /// Skip the on-disk cache (always fetch fresh).
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Cache freshness window in seconds.
+    #[arg(long, default_value_t = 3600)]
+    pub cache_ttl: u64,
+
+    /// Max concurrent requests when fetching multiple URLs.
+    #[arg(long, default_value_t = 8)]
+    pub concurrency: usize,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

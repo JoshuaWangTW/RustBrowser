@@ -70,3 +70,31 @@ fn collapse_spaces(line: &str) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapse_spaces_keeps_indent_collapses_inner() {
+        assert_eq!(collapse_spaces("a      b"), "a b");
+        assert_eq!(collapse_spaces("    indented    text"), "    indented text");
+        assert_eq!(collapse_spaces("no extra spaces"), "no extra spaces");
+    }
+
+    #[test]
+    fn normalize_collapses_blank_lines_and_padding() {
+        let out = normalize("# Title\n\n\n\nrow   |   cell\n\n\n");
+        assert!(!out.contains("\n\n\n"), "no triple blank lines");
+        assert!(out.contains("row | cell"), "table padding collapsed");
+    }
+
+    #[test]
+    fn normalize_preserves_code_blocks() {
+        let out = normalize("```\nlet x  =  5;\n```");
+        assert!(
+            out.contains("let x  =  5;"),
+            "code block spacing must be preserved"
+        );
+    }
+}

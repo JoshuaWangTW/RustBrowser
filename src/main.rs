@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
+use serde_json::json;
 
-use cli::{Cli, Command, Format};
-use rustbrowser::{DistillOptions, distill};
+use cli::{Cli, Command, FetchArgs, Format};
+use rustbrowser::{DistillOptions, Distilled, distill, distill_many};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -18,17 +19,63 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_fetch(args: cli::FetchArgs) -> Result<()> {
+async fn run_fetch(args: FetchArgs) -> Result<()> {
     let opts = DistillOptions {
         timeout: Duration::from_secs(args.timeout),
         user_agent: None,
-        selector: args.selector,
+        selector: args.selector.clone(),
         measure_tokens: args.stats,
+        use_cache: !args.no_cache,
+        cache_ttl: args.cache_ttl,
     };
 
-    let result = distill(&args.url, &opts).await?;
+    if args.urls.len() == 1 {
+        let result = distill(&args.urls[0], &opts).await?;
+        print_result(&result, args.format);
+        print_stats(&result);
+    } else {
+        run_batch(&args, &opts).await;
+    }
+    Ok(())
+}
 
-    match args.format {
+/// Fetch multiple URLs concurrently and print them in input order.
+async fn run_batch(args: &FetchArgs, opts: &DistillOptions) {
+    let results = distill_many(&args.urls, opts, args.concurrency).await;
+
+    if matches!(args.format, Format::Json) {
+        let arr: Vec<_> = results
+            .iter()
+            .map(|(url, r)| match r {
+                Ok(d) => json!({ "url": url, "ok": true, "result": d }),
+                Err(e) => json!({ "url": url, "ok": false, "error": e.to_string() }),
+            })
+            .collect();
+        match serde_json::to_string_pretty(&arr) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("JSON output failed: {e}"),
+        }
+        return;
+    }
+
+    let mut first = true;
+    for (url, r) in &results {
+        match r {
+            Ok(d) => {
+                if !first {
+                    println!("\n\n═══════════════════════════════\n");
+                }
+                first = false;
+                println!("<!-- {url} -->");
+                print_result(d, args.format);
+            }
+            Err(e) => eprintln!("✗ {url}: {e}"),
+        }
+    }
+}
+
+fn print_result(result: &Distilled, format: Format) {
+    match format {
         Format::Markdown => {
             if !result.title.is_empty() {
                 println!("# {}\n", result.title);
@@ -36,11 +83,15 @@ async fn run_fetch(args: cli::FetchArgs) -> Result<()> {
             println!("{}", result.markdown);
         }
         Format::Text => println!("{}", result.text),
-        Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        Format::Json => match serde_json::to_string_pretty(result) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("JSON output failed: {e}"),
+        },
     }
+}
 
-    // `result.stats` is Some only when stats were requested, so this also
-    // gates on the --stats flag.
+fn print_stats(result: &Distilled) {
+    // `result.stats` is Some only when --stats was passed.
     if let Some(s) = &result.stats {
         eprintln!();
         eprintln!("── token stats ───────────────");
@@ -53,6 +104,4 @@ async fn run_fetch(args: cli::FetchArgs) -> Result<()> {
             s.saved_ratio * 100.0
         );
     }
-
-    Ok(())
 }
