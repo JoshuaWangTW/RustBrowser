@@ -2,6 +2,9 @@
 name = "rustbrowser"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Token-lean web content fetcher for LLMs — distills pages to clean Markdown."
+repository = "https://github.com/JoshuaWangTW/RustBrowser"
 
 [dependencies]
 anyhow = "1.0.102"
