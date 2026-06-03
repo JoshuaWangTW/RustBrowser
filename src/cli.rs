@@ -69,6 +69,14 @@ pub struct FetchArgs {
     /// Headless JS-rendering fallback: off, auto (default), or always.
     #[arg(long, value_enum, default_value_t = JsMode::Auto)]
     pub js: JsMode,
+
+    /// Headless wait / virtual-time budget in milliseconds.
+    #[arg(long)]
+    pub js_wait: Option<u64>,
+
+    /// Wait until this CSS selector appears before capturing (uses CDP).
+    #[arg(long)]
+    pub js_wait_for: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

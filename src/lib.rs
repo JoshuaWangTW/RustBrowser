@@ -59,6 +59,10 @@ pub struct DistillOptions {
     pub links_full: bool,
     /// Headless JS-rendering fallback policy.
     pub js_mode: JsMode,
+    /// Override the headless wait / virtual-time budget, in milliseconds.
+    pub js_wait: Option<u64>,
+    /// Wait until this CSS selector appears before capturing (drives CDP).
+    pub js_wait_for: Option<String>,
 }
 
 impl Default for DistillOptions {
@@ -74,6 +78,8 @@ impl Default for DistillOptions {
             extract_tables: false,
             links_full: false,
             js_mode: JsMode::Auto,
+            js_wait: None,
+            js_wait_for: None,
         }
     }
 }
@@ -131,19 +137,31 @@ pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
         JsMode::Off => false,
         JsMode::Always => true,
         JsMode::Auto => {
-            // Count visible (non-whitespace) characters: readability's text is
-            // padded with lots of layout whitespace that would otherwise mask
-            // an empty, JS-rendered page as if it had real content.
-            let visible: usize = content.text.split_whitespace().map(str::len).sum();
-            opts.selector.is_none()
-                && visible < render::JS_TEXT_THRESHOLD
-                && render::looks_like_js_app(&fetched.html)
+            // An explicit wait-for selector means "definitely render". Otherwise
+            // count visible (non-whitespace) characters: readability's text is
+            // padded with layout whitespace that would mask an empty JS page.
+            opts.js_wait_for.is_some() || {
+                let visible: usize = content.text.split_whitespace().map(str::len).sum();
+                opts.selector.is_none()
+                    && visible < render::JS_TEXT_THRESHOLD
+                    && render::looks_like_js_app(&fetched.html)
+            }
         }
     };
-    if needs_js && let Ok(rendered) = render::render_html(&fetched.final_url, opts.timeout).await {
-        fetched.raw_bytes = rendered.len();
-        fetched.html = rendered;
-        content = extract_content(&fetched, opts)?;
+    if needs_js {
+        let budget = opts
+            .js_wait
+            .map(Duration::from_millis)
+            .unwrap_or(opts.timeout);
+        let rendered = match &opts.js_wait_for {
+            Some(sel) => render::render_html_cdp(&fetched.final_url, sel, budget).await,
+            None => render::render_html(&fetched.final_url, budget).await,
+        };
+        if let Ok(html) = rendered {
+            fetched.raw_bytes = html.len();
+            fetched.html = html;
+            content = extract_content(&fetched, opts)?;
+        }
     }
 
     let markdown = convert::to_markdown(&content.content_html)?;

@@ -71,6 +71,12 @@ struct FetchParams {
     /// Headless JS rendering: "off", "auto" (default), or "always".
     #[serde(default)]
     js: Option<String>,
+    /// Headless wait / virtual-time budget in milliseconds.
+    #[serde(default)]
+    js_wait: Option<u64>,
+    /// Wait until this CSS selector appears before capturing (uses CDP).
+    #[serde(default)]
+    js_wait_for: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -107,6 +113,12 @@ struct FetchManyParams {
     /// Headless JS rendering: "off", "auto" (default), or "always".
     #[serde(default)]
     js: Option<String>,
+    /// Headless wait / virtual-time budget in milliseconds.
+    #[serde(default)]
+    js_wait: Option<u64>,
+    /// Wait until this CSS selector appears before capturing (uses CDP).
+    #[serde(default)]
+    js_wait_for: Option<String>,
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -129,6 +141,8 @@ fn opts_from(
     tables: Option<bool>,
     links_full: Option<bool>,
     js: Option<&str>,
+    js_wait: Option<u64>,
+    js_wait_for: Option<String>,
 ) -> DistillOptions {
     let links_full = links_full.unwrap_or(false);
     DistillOptions {
@@ -142,6 +156,8 @@ fn opts_from(
         extract_tables: tables.unwrap_or(false),
         links_full,
         js_mode: parse_js_mode(js),
+        js_wait,
+        js_wait_for,
     }
 }
 
@@ -217,6 +233,8 @@ impl RustBrowserServer {
             p.extract_tables,
             p.links_full,
             p.js.as_deref(),
+            p.js_wait,
+            p.js_wait_for,
         );
         let result = distill(&p.url, &opts)
             .await
@@ -242,6 +260,8 @@ impl RustBrowserServer {
             p.extract_tables,
             p.links_full,
             p.js.as_deref(),
+            p.js_wait,
+            p.js_wait_for,
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");

@@ -35,6 +35,8 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
             cli::JsMode::Auto => rustbrowser::JsMode::Auto,
             cli::JsMode::Always => rustbrowser::JsMode::Always,
         },
+        js_wait: args.js_wait,
+        js_wait_for: args.js_wait_for.clone(),
     };
 
     if args.urls.len() == 1 {

@@ -7,11 +7,16 @@
 
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 /// Below this many characters of extracted text, an Auto-mode page is a
 /// candidate for headless re-rendering (if it also looks like a JS app).
@@ -100,6 +105,148 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
         bail!("headless render produced an empty DOM");
     }
     Ok(html)
+}
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Render `url` over the Chrome DevTools Protocol, waiting until `wait_for` (a
+/// CSS selector) appears in the DOM before capturing it. If the selector never
+/// shows up within `budget`, we capture whatever is present. Heavier than
+/// `--dump-dom`, but lets you wait for content that loads asynchronously.
+pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Result<String> {
+    let chrome = find_chrome()
+        .context("no Chrome/Chromium/Edge found; set RUSTBROWSER_CHROME to its full path")?;
+
+    let uniq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let user_dir =
+        std::env::temp_dir().join(format!("rustbrowser-cdp-{}-{uniq}", std::process::id()));
+    let _ = std::fs::create_dir_all(&user_dir);
+
+    let mut child = Command::new(&chrome)
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--remote-debugging-port=0",
+            &format!("--user-data-dir={}", user_dir.display()),
+            "about:blank",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("launching headless Chrome for CDP")?;
+
+    // Always tear the browser and temp dir down, even on error.
+    let outcome = cdp_session(url, wait_for, budget, &user_dir).await;
+    let _ = child.kill().await;
+    let _ = std::fs::remove_dir_all(&user_dir);
+    outcome
+}
+
+async fn cdp_session(
+    url: &str,
+    wait_for: &str,
+    budget: Duration,
+    user_dir: &Path,
+) -> Result<String> {
+    let port = read_devtools_port(user_dir, Duration::from_secs(15)).await?;
+    let ws_url = page_ws_url(port).await?;
+    let (mut ws, _) = connect_async(&ws_url)
+        .await
+        .context("connecting to Chrome DevTools")?;
+
+    cdp_call(&mut ws, 1, "Page.enable", json!({})).await?;
+    cdp_call(&mut ws, 2, "Page.navigate", json!({ "url": url })).await?;
+
+    let selector_json = serde_json::to_string(wait_for).unwrap_or_else(|_| "\"\"".into());
+    let probe = format!("!!document.querySelector({selector_json})");
+    let deadline = Instant::now() + budget;
+    let mut id = 3u64;
+    loop {
+        if cdp_eval(&mut ws, id, &probe).await?.as_bool() == Some(true) {
+            break;
+        }
+        id += 1;
+        if Instant::now() >= deadline {
+            break; // give up waiting; capture the current DOM
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let dom = cdp_eval(&mut ws, id + 1, "document.documentElement.outerHTML").await?;
+    dom.as_str()
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty())
+        .context("CDP render produced an empty DOM")
+}
+
+/// Send one CDP request and return the `result` of the matching-id response.
+async fn cdp_call(ws: &mut Ws, id: u64, method: &str, params: Value) -> Result<Value> {
+    let req = json!({ "id": id, "method": method, "params": params });
+    ws.send(Message::Text(req.to_string().into()))
+        .await
+        .context("sending CDP request")?;
+    while let Some(msg) = ws.next().await {
+        if let Message::Text(text) = msg.context("CDP stream error")? {
+            let v: Value = serde_json::from_str(&text).context("parsing CDP message")?;
+            if v.get("id").and_then(Value::as_u64) == Some(id) {
+                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+    bail!("CDP connection closed before response")
+}
+
+/// `Runtime.evaluate`, returning the JS value (by value).
+async fn cdp_eval(ws: &mut Ws, id: u64, expr: &str) -> Result<Value> {
+    let r = cdp_call(
+        ws,
+        id,
+        "Runtime.evaluate",
+        json!({ "expression": expr, "returnByValue": true }),
+    )
+    .await?;
+    Ok(r.pointer("/result/value").cloned().unwrap_or(Value::Null))
+}
+
+/// Read the port Chrome wrote to `DevToolsActivePort` in its user-data dir.
+async fn read_devtools_port(user_dir: &Path, wait: Duration) -> Result<u16> {
+    let path = user_dir.join("DevToolsActivePort");
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Some(line) = content.lines().next()
+            && let Ok(port) = line.trim().parse::<u16>()
+        {
+            return Ok(port);
+        }
+        if Instant::now() >= deadline {
+            bail!("Chrome did not expose a debugging port in time");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Ask Chrome's HTTP endpoint for the first page target's WebSocket URL.
+async fn page_ws_url(port: u16) -> Result<String> {
+    let url = format!("http://127.0.0.1:{port}/json/list");
+    let body = reqwest::get(&url)
+        .await
+        .context("querying CDP targets")?
+        .text()
+        .await
+        .context("reading CDP targets")?;
+    let targets: Vec<Value> = serde_json::from_str(&body).context("parsing CDP targets")?;
+    targets
+        .iter()
+        .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .and_then(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
+        .map(str::to_string)
+        .context("no CDP page target found")
 }
 
 #[cfg(test)]

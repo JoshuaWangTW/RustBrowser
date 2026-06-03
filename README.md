@@ -90,9 +90,12 @@ rustbrowser fetch <url> --selector "main article"
 
 # 結構化擷取連結 / 表格(搭 --format json 最完整)
 rustbrowser fetch <url> --links --tables --format json
+rustbrowser fetch <url> --links-all                   # 全頁連結(含 nav),供爬蟲
 
 # JS 動態站:auto(預設,自動偵測)/ always(強制)/ off(純 HTTP)
 rustbrowser fetch <spa-url> --js always
+rustbrowser fetch <spa-url> --js-wait 5000            # 給 JS 更多等待時間(ms)
+rustbrowser fetch <spa-url> --js-wait-for ".results"  # 等特定元素出現才抓(CDP)
 
 # token 統計 / 快取與並發控制
 rustbrowser fetch <url> --stats
@@ -108,6 +111,7 @@ rustbrowser fetch <urls...> --concurrency 4   # 批次並發上限(預設 8)
 對 React/Vue 或任何「JS 才渲染內容」的站,純 HTTP 抓到的是空殼。`--js auto`(預設)會偵測「萃取文字極少 + 頁面 JS 偏重」,**自動**呼叫系統 Chrome/Edge 的 `--headless --dump-dom` 取得渲染後 DOM —— **零編譯依賴**(不綁瀏覽器引擎),只在必要時才用,保持輕量。
 
 - `--js off` 完全不用 headless;`--js always` 強制每頁都 render。
+- `--js-wait <ms>` 給慢載入站更多時間;`--js-wait-for "<css>"` 等特定元素出現才抓 —— 走 **CDP**(Chrome DevTools Protocol,透過 tokio-tungstenite 連 `ws://localhost`,無需 TLS),適合「要打 API 才出內容」的站。
 - 找不到瀏覽器時可用環境變數 `RUSTBROWSER_CHROME` 指定執行檔路徑。
 
 ## 使用方式:給 Claude Code 用(MCP)
@@ -127,7 +131,7 @@ claude mcp add rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowse
 claude mcp add --scope user rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowser-mcp.exe
 ```
 
-共同參數:`format`、`selector`、`stats`、`timeout_secs`、`no_cache`、`cache_ttl`、`extract_links`、`extract_tables`、`js`(off/auto/always);`fetch_urls` 另有 `urls` 與 `concurrency`。
+共同參數:`format`、`selector`、`stats`、`timeout_secs`、`no_cache`、`cache_ttl`、`extract_links`、`extract_tables`、`links_full`、`js`(off/auto/always)、`js_wait`、`js_wait_for`;`fetch_urls` 另有 `urls` 與 `concurrency`。
 
 ## 從原始碼編譯
 
@@ -151,10 +155,11 @@ cargo build --release
 - ✅ **v0.2** — 磁碟快取、批次並發抓取
 - ✅ **v0.3** — MCP server,Claude Code 以原生工具 `fetch_url` / `fetch_urls` 呼叫
 - ✅ **v0.4** — headless 自動 fallback(auto 偵測 JS 動態站)+ 連結/表格結構化擷取
+- ✅ **v0.5** — 全頁連結擷取 · headless 等待控制(`--js-wait` / CDP `--js-wait-for`)· release 發布自動化
 
 ## 技術棧
 
-Rust · tokio · reqwest(rustls) · scraper · dom_smoothie · htmd · tiktoken-rs · clap · rmcp · futures · sha2 · dirs
+Rust · tokio · reqwest(rustls) · scraper · dom_smoothie · htmd · tiktoken-rs · clap · rmcp · futures · sha2 · dirs · tokio-tungstenite(CDP)
 
 ---
 
