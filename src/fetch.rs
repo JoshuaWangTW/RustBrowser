@@ -5,11 +5,13 @@
 //! the extraction stage. This is the cheap path that avoids spinning up a
 //! full rendering engine for the common case.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::{Encoding, UTF_8};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use url::{Host, Url};
 
@@ -70,6 +72,11 @@ impl Fetcher {
             .brotli(true)
             .deflate(true)
             .redirect(reqwest::redirect::Policy::none())
+            // Resolve + screen IPs at the connection layer so reqwest dials the
+            // exact addresses we validated — no separate pre-flight lookup that a
+            // rebinding/low-TTL DNS could diverge from. Set once on the shared
+            // client, so it applies to every request without breaking pooling.
+            .dns_resolver(Arc::new(SafeResolver))
             .build()
             .context("building HTTP client")?;
 
@@ -81,7 +88,10 @@ impl Fetcher {
         let mut current = parse_and_validate_url_basics(url)?;
 
         for redirect_count in 0..=self.opts.max_redirects {
-            validate_url_network_boundary(&current).await?;
+            // First line: cheap, DNS-free checks (scheme, literal IPs, localhost).
+            // The connection-layer SafeResolver is the authoritative second line
+            // that screens the IPs reqwest actually dials.
+            validate_host_basics(&current)?;
 
             let mut resp = self
                 .client
@@ -169,24 +179,51 @@ fn validate_host_basics(url: &Url) -> Result<()> {
     Ok(())
 }
 
-async fn validate_url_network_boundary(url: &Url) -> Result<()> {
-    validate_host_basics(url)?;
+/// Custom DNS resolver that screens every resolved address against the same
+/// block-list used for literal IPs. reqwest connects to exactly the addresses
+/// this returns, so the IP that passes validation is the IP that gets dialed.
+///
+/// This closes the DNS-rebinding gap: previously the safety check resolved DNS
+/// once and reqwest resolved again at connect time, and a malicious or low-TTL
+/// record could point the second lookup at internal space (`127.0.0.1`,
+/// `169.254.169.254`, …). With the check living inside the resolver there is
+/// only one resolution and it is the one that is enforced. TLS SNI and
+/// certificate validation still use the original domain — reqwest keeps the
+/// hostname and only takes the socket addresses from us.
+#[derive(Debug)]
+struct SafeResolver;
 
-    if let Some(host) = url.host_str()
-        && url.host().is_some_and(|h| matches!(h, Host::Domain(_)))
-    {
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| anyhow!("URL has no known default port"))?;
-        let addrs = tokio::net::lookup_host((host, port))
-            .await
-            .with_context(|| format!("resolving {host}"))?;
-        for addr in addrs {
-            validate_ip(addr.ip())?;
-        }
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(resolve_safely(name))
     }
+}
 
-    Ok(())
+async fn resolve_safely(name: Name) -> Result<Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    let host = name.as_str();
+    // Port 0 is a placeholder; reqwest replaces it with the URL's real port.
+    let resolved = tokio::net::lookup_host((host, 0)).await?;
+    let safe = screen_resolved_addrs(host, resolved)?;
+    Ok(Box::new(safe.into_iter()) as Addrs)
+}
+
+/// Keep only addresses that survive `is_blocked_ip`. Errors if every resolved
+/// address is blocked, so a host that resolves solely to internal space is
+/// refused at connect time instead of silently dialing nothing.
+fn screen_resolved_addrs(
+    host: &str,
+    addrs: impl Iterator<Item = SocketAddr>,
+) -> std::io::Result<Vec<SocketAddr>> {
+    let safe: Vec<SocketAddr> = addrs.filter(|addr| !is_blocked_ip(addr.ip())).collect();
+    if safe.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to connect to {host}: all resolved addresses are private, local, link-local, or metadata"
+            ),
+        ));
+    }
+    Ok(safe)
 }
 
 fn validate_ip(ip: IpAddr) -> Result<()> {
@@ -353,6 +390,49 @@ mod tests {
         assert!(validate_cached_url("http://[64:ff9b::7f00:1]/").is_err());
         // A normal public IP in the 100.x but outside CGNAT stays allowed.
         assert!(validate_cached_url("http://100.0.0.1/").is_ok());
+    }
+
+    #[test]
+    fn screen_resolved_addrs_rejects_all_private() {
+        // A host whose addresses are all internal is refused outright.
+        let blocked = [
+            SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0)),
+            SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 0)),
+            SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 0)),
+        ];
+        assert!(screen_resolved_addrs("evil.example", blocked.into_iter()).is_err());
+    }
+
+    #[test]
+    fn screen_resolved_addrs_keeps_only_public() {
+        // Mixed resolution: internal addresses are dropped, public ones survive.
+        let public = SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 0));
+        let mixed = [SocketAddr::from((Ipv4Addr::new(192, 168, 1, 1), 0)), public];
+        let safe = screen_resolved_addrs("mixed.example", mixed.into_iter()).unwrap();
+        assert_eq!(safe, vec![public]);
+    }
+
+    #[tokio::test]
+    async fn safe_resolver_rejects_private_ip() {
+        // A private/metadata IP literal resolves locally (no network) and must be
+        // refused — this is the exact path reqwest drives at connect time.
+        let loopback: Name = "127.0.0.1".parse().unwrap();
+        assert!(SafeResolver.resolve(loopback).await.is_err());
+
+        let metadata: Name = "169.254.169.254".parse().unwrap();
+        assert!(SafeResolver.resolve(metadata).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn safe_resolver_allows_public_ip() {
+        let name: Name = "8.8.8.8".parse().unwrap();
+        let addrs: Vec<SocketAddr> = SafeResolver
+            .resolve(name)
+            .await
+            .expect("public IP must pass screening")
+            .collect();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[test]

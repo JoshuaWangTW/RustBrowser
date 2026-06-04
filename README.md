@@ -112,7 +112,7 @@ rustbrowser fetch <urls...> --concurrency 4   # 批次並發上限(預設 8)
 
 安全邊界:fetch 只允許 `http` / `https`,拒絕 `localhost`、loopback、private IP(含 CGNAT `100.64/10`、`0.0.0.0/8`)、link-local、metadata IP;IPv6 的 IPv4-mapped 與 NAT64(`64:ff9b::/96`)內嵌位址會還原後再檢查;每一段 redirect 後的目標 URL、以及從磁碟快取讀回的 URL,都重新檢查。
 
-> ⚠️ **不防 DNS rebinding**:URL 的安全檢查與 reqwest 實際連線是兩次獨立的 DNS 解析,惡意或低 TTL 的 DNS 可在連線當下改指向內網 IP,繞過上述黑名單。若要在不可信環境抓「他人提供的任意 URL」,請在網路層額外隔離(如 egress proxy,或改用綁定已驗證 IP 的 resolver)。
+IP 黑名單的最終把關落在**連線層**:自訂的 reqwest DNS resolver 在解析當下就對每個位址跑同一套黑名單,只把通過的 IP 交給 reqwest 連線(全部被擋就直接拒絕)。因此 reqwest 撥號的就是「已驗證的那個 IP」——**DNS rebinding 已被防護**,不再有「安全檢查」與「實際連線」兩次獨立 DNS 解析、可被低 TTL 或惡意 DNS 在連線當下掉包的縫隙。字面 IP、scheme、localhost 等不需 DNS 的檢查仍在送出請求前先擋一道;TLS 的 SNI 與憑證驗證仍以原始 domain 進行。
 
 ## JS 動態站(headless fallback)
 
