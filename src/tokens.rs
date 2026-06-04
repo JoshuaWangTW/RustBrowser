@@ -4,19 +4,30 @@
 //! tokenizer differs, so treat these as *estimates*; the ratio between raw
 //! and distilled is what matters and that holds across tokenizers.
 
+#[cfg(feature = "stats")]
 use std::sync::OnceLock;
 
+#[cfg(feature = "stats")]
 use tiktoken_rs::CoreBPE;
 
+#[cfg(feature = "stats")]
 static BPE: OnceLock<CoreBPE> = OnceLock::new();
 
+#[cfg(feature = "stats")]
 fn bpe() -> &'static CoreBPE {
     BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("load cl100k_base tokenizer"))
 }
 
 /// Count tokens in a string (loads the tokenizer once, then reuses it).
+#[cfg(feature = "stats")]
 pub fn count(text: &str) -> usize {
     bpe().encode_with_special_tokens(text).len()
+}
+
+/// Lightweight fallback for builds without the exact tokenizer dependency.
+#[cfg(not(feature = "stats"))]
+pub fn count(text: &str) -> usize {
+    text.split_whitespace().count()
 }
 
 /// Before/after token comparison for a single fetch.

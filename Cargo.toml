@@ -11,19 +11,37 @@ anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 dirs = "6.0.0"
 dom_smoothie = "0.17.0"
+encoding_rs = "0.8"
 futures = "0.3.32"
 htmd = "0.5.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "gzip", "brotli", "deflate", "charset", "http2"] }
-rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"] }
-schemars = "1.2.1"
+rmcp = { version = "1.7.0", features = ["server", "transport-io", "macros"], optional = true }
+schemars = { version = "1.2.1", optional = true }
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
-tiktoken-rs = "0.12.0"
+tiktoken-rs = { version = "0.12.0", optional = true }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "time"] }
-tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake"], optional = true }
 url = "2.5.8"
+
+[features]
+default = ["cli", "mcp", "stats", "js"]
+cli = []
+mcp = ["dep:rmcp", "dep:schemars"]
+stats = ["dep:tiktoken-rs"]
+js = ["dep:tokio-tungstenite"]
+
+[[bin]]
+name = "rustbrowser"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "rustbrowser-mcp"
+path = "src/bin/rustbrowser-mcp.rs"
+required-features = ["mcp"]
 
 # Optimised release build: small, fast, single static-ish binary.
 [profile.release]

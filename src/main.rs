@@ -37,6 +37,7 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         },
         js_wait: args.js_wait,
         js_wait_for: args.js_wait_for.clone(),
+        max_bytes: args.max_bytes,
     };
 
     if args.urls.len() == 1 {

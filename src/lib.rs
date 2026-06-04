@@ -19,8 +19,8 @@ use futures::stream::{self, StreamExt};
 use scraper::{Html, Selector};
 use serde::Serialize;
 
-use crate::cache::CachedFetch;
-use crate::fetch::{FetchOptions, FetchResult};
+use crate::cache::{CachedFetch, CachedRender};
+use crate::fetch::{FetchOptions, FetchResult, Fetcher};
 use crate::structured::{Link, Table};
 use crate::tokens::TokenStats;
 
@@ -63,6 +63,8 @@ pub struct DistillOptions {
     pub js_wait: Option<u64>,
     /// Wait until this CSS selector appears before capturing (drives CDP).
     pub js_wait_for: Option<String>,
+    /// Hard cap on decoded response bytes retained from each HTTP response.
+    pub max_bytes: usize,
 }
 
 impl Default for DistillOptions {
@@ -80,6 +82,7 @@ impl Default for DistillOptions {
             js_mode: JsMode::Auto,
             js_wait: None,
             js_wait_for: None,
+            max_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -116,6 +119,189 @@ pub struct Distilled {
     pub tables: Option<Vec<Table>>,
 }
 
+/// Reusable core pipeline. Construct one per option set to preserve HTTP
+/// connection pooling across a batch.
+pub struct BrowserCore {
+    fetcher: Fetcher,
+}
+
+impl BrowserCore {
+    pub fn new(opts: &DistillOptions) -> Result<Self> {
+        let mut fopts = FetchOptions {
+            timeout: opts.timeout,
+            max_bytes: opts.max_bytes,
+            ..Default::default()
+        };
+        if let Some(ua) = &opts.user_agent {
+            fopts.user_agent = ua.clone();
+        }
+        Ok(Self {
+            fetcher: Fetcher::new(fopts)?,
+        })
+    }
+
+    /// Run the full pipeline for a single URL.
+    pub async fn distill(&self, url: &str, opts: &DistillOptions) -> Result<Distilled> {
+        let mut fetched = self.fetch_maybe_cached(url, opts).await?;
+        let mut content = extract_content(&fetched, opts)?;
+
+        // Headless fallback: re-fetch via a real browser when the HTTP HTML looks
+        // like an unrendered JS app (or when always/never is forced). Failures here
+        // are non-fatal — we keep the HTTP result.
+        let needs_js = match opts.js_mode {
+            JsMode::Off => false,
+            JsMode::Always => true,
+            JsMode::Auto => {
+                // An explicit wait-for selector means "definitely render". Otherwise
+                // count visible (non-whitespace) characters: readability's text is
+                // padded with layout whitespace that would mask an empty JS page.
+                opts.js_wait_for.is_some() || {
+                    let visible: usize = content.text.split_whitespace().map(str::len).sum();
+                    opts.selector.is_none()
+                        && visible < render::JS_TEXT_THRESHOLD
+                        && render::looks_like_js_app(&fetched.html)
+                }
+            }
+        };
+        if needs_js {
+            let budget = opts
+                .js_wait
+                .map(Duration::from_millis)
+                .unwrap_or(opts.timeout);
+            let cache_identity = cache::render_identity(
+                &fetched.final_url,
+                js_mode_label(opts.js_mode),
+                budget.as_millis(),
+                opts.js_wait_for.as_deref(),
+            );
+
+            let rendered_cache = opts
+                .use_cache
+                .then(|| cache::get_render(&cache_identity, opts.cache_ttl))
+                .flatten();
+
+            if let Some(cached) = rendered_cache {
+                fetch::validate_cached_url(&cached.final_url)?;
+                fetched.final_url = cached.final_url;
+                fetched.raw_bytes = cached.raw_bytes;
+                fetched.html = cached.html;
+                content = extract_content(&fetched, opts)?;
+            } else {
+                let rendered = match &opts.js_wait_for {
+                    Some(sel) => render::render_html_cdp(&fetched.final_url, sel, budget).await,
+                    None => render::render_html(&fetched.final_url, budget).await,
+                };
+                if let Ok(html) = rendered {
+                    fetched.raw_bytes = html.len();
+                    fetched.html = html;
+                    content = extract_content(&fetched, opts)?;
+
+                    if opts.use_cache {
+                        let _ = cache::put_render(
+                            &cache_identity,
+                            &CachedRender {
+                                fetched_at: cache::now(),
+                                final_url: fetched.final_url.clone(),
+                                html: fetched.html.clone(),
+                                raw_bytes: fetched.raw_bytes,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let markdown = convert::to_markdown(&content.content_html)?;
+
+        // Structured extraction runs against the distilled content, so links and
+        // tables reflect the main body rather than page-wide navigation chrome.
+        let links = opts.extract_links.then(|| {
+            // Whole-page links (incl. nav) for crawling, or just the main content.
+            let scope = if opts.links_full {
+                &fetched.html
+            } else {
+                &content.content_html
+            };
+            structured::extract_links(scope, &fetched.final_url)
+        });
+        let tables = opts
+            .extract_tables
+            .then(|| structured::extract_tables(&content.content_html));
+
+        let text = if content.text.is_empty() {
+            markdown.clone()
+        } else {
+            content.text
+        };
+
+        let stats = if opts.measure_tokens {
+            let ts = TokenStats::measure(&fetched.html, &markdown);
+            Some(Stats {
+                raw_bytes: fetched.raw_bytes,
+                raw_tokens: ts.raw_tokens,
+                output_tokens: ts.output_tokens,
+                saved_tokens: ts.saved(),
+                saved_ratio: ts.saved_ratio(),
+            })
+        } else {
+            None
+        };
+
+        Ok(Distilled {
+            final_url: fetched.final_url,
+            status: fetched.status,
+            title: content.title,
+            byline: content.byline,
+            excerpt: content.excerpt,
+            markdown,
+            text,
+            stats,
+            links,
+            tables,
+        })
+    }
+
+    /// Fetch a URL, consulting and populating the on-disk cache when enabled.
+    /// Cache writes are best-effort: a failure to cache is not a failure to fetch.
+    async fn fetch_maybe_cached(&self, url: &str, opts: &DistillOptions) -> Result<FetchResult> {
+        fetch::validate_cached_url(url)?;
+
+        let cached = if opts.use_cache {
+            cache::get(url, opts.cache_ttl)
+        } else {
+            None
+        };
+        if let Some(c) = cached {
+            fetch::validate_cached_url(&c.final_url)?;
+            return Ok(FetchResult {
+                final_url: c.final_url,
+                status: c.status,
+                content_type: c.content_type,
+                html: c.html,
+                raw_bytes: c.raw_bytes,
+            });
+        }
+
+        let fetched = self.fetcher.fetch(url).await?;
+
+        if opts.use_cache {
+            let _ = cache::put(
+                url,
+                &CachedFetch {
+                    fetched_at: cache::now(),
+                    final_url: fetched.final_url.clone(),
+                    status: fetched.status,
+                    content_type: fetched.content_type.clone(),
+                    html: fetched.html.clone(),
+                    raw_bytes: fetched.raw_bytes,
+                },
+            );
+        }
+
+        Ok(fetched)
+    }
+}
+
 /// Intermediate extracted content, before Markdown conversion.
 struct Content {
     title: String,
@@ -127,91 +313,7 @@ struct Content {
 
 /// Run the full pipeline for a single URL.
 pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
-    let mut fetched = fetch_maybe_cached(url, opts).await?;
-    let mut content = extract_content(&fetched, opts)?;
-
-    // Headless fallback: re-fetch via a real browser when the HTTP HTML looks
-    // like an unrendered JS app (or when always/never is forced). Failures here
-    // are non-fatal — we keep the HTTP result.
-    let needs_js = match opts.js_mode {
-        JsMode::Off => false,
-        JsMode::Always => true,
-        JsMode::Auto => {
-            // An explicit wait-for selector means "definitely render". Otherwise
-            // count visible (non-whitespace) characters: readability's text is
-            // padded with layout whitespace that would mask an empty JS page.
-            opts.js_wait_for.is_some() || {
-                let visible: usize = content.text.split_whitespace().map(str::len).sum();
-                opts.selector.is_none()
-                    && visible < render::JS_TEXT_THRESHOLD
-                    && render::looks_like_js_app(&fetched.html)
-            }
-        }
-    };
-    if needs_js {
-        let budget = opts
-            .js_wait
-            .map(Duration::from_millis)
-            .unwrap_or(opts.timeout);
-        let rendered = match &opts.js_wait_for {
-            Some(sel) => render::render_html_cdp(&fetched.final_url, sel, budget).await,
-            None => render::render_html(&fetched.final_url, budget).await,
-        };
-        if let Ok(html) = rendered {
-            fetched.raw_bytes = html.len();
-            fetched.html = html;
-            content = extract_content(&fetched, opts)?;
-        }
-    }
-
-    let markdown = convert::to_markdown(&content.content_html)?;
-
-    // Structured extraction runs against the distilled content, so links and
-    // tables reflect the main body rather than page-wide navigation chrome.
-    let links = opts.extract_links.then(|| {
-        // Whole-page links (incl. nav) for crawling, or just the main content.
-        let scope = if opts.links_full {
-            &fetched.html
-        } else {
-            &content.content_html
-        };
-        structured::extract_links(scope, &fetched.final_url)
-    });
-    let tables = opts
-        .extract_tables
-        .then(|| structured::extract_tables(&content.content_html));
-
-    let text = if content.text.is_empty() {
-        markdown.clone()
-    } else {
-        content.text
-    };
-
-    let stats = if opts.measure_tokens {
-        let ts = TokenStats::measure(&fetched.html, &markdown);
-        Some(Stats {
-            raw_bytes: fetched.raw_bytes,
-            raw_tokens: ts.raw_tokens,
-            output_tokens: ts.output_tokens,
-            saved_tokens: ts.saved(),
-            saved_ratio: ts.saved_ratio(),
-        })
-    } else {
-        None
-    };
-
-    Ok(Distilled {
-        final_url: fetched.final_url,
-        status: fetched.status,
-        title: content.title,
-        byline: content.byline,
-        excerpt: content.excerpt,
-        markdown,
-        text,
-        stats,
-        links,
-        tables,
-    })
+    BrowserCore::new(opts)?.distill(url, opts).await
 }
 
 /// Run readability (or a CSS selector) over a fetched page.
@@ -246,58 +348,27 @@ pub async fn distill_many(
     opts: &DistillOptions,
     concurrency: usize,
 ) -> Vec<(String, Result<Distilled>)> {
+    let core = match BrowserCore::new(opts) {
+        Ok(core) => core,
+        Err(e) => {
+            let msg = e.to_string();
+            return urls
+                .iter()
+                .cloned()
+                .map(|url| (url, Err(anyhow!("building HTTP client failed: {msg}"))))
+                .collect();
+        }
+    };
+    let core = &core;
+
     stream::iter(urls.iter().cloned())
         .map(|url| async move {
-            let result = distill(&url, opts).await;
+            let result = core.distill(&url, opts).await;
             (url, result)
         })
         .buffered(concurrency.max(1))
         .collect()
         .await
-}
-
-/// Fetch a URL, consulting and populating the on-disk cache when enabled.
-/// Cache writes are best-effort: a failure to cache is not a failure to fetch.
-async fn fetch_maybe_cached(url: &str, opts: &DistillOptions) -> Result<FetchResult> {
-    let cached = if opts.use_cache {
-        cache::get(url, opts.cache_ttl)
-    } else {
-        None
-    };
-    if let Some(c) = cached {
-        return Ok(FetchResult {
-            final_url: c.final_url,
-            status: c.status,
-            content_type: c.content_type,
-            html: c.html,
-            raw_bytes: c.raw_bytes,
-        });
-    }
-
-    let mut fopts = FetchOptions {
-        timeout: opts.timeout,
-        ..Default::default()
-    };
-    if let Some(ua) = &opts.user_agent {
-        fopts.user_agent = ua.clone();
-    }
-    let fetched = fetch::fetch(url, &fopts).await?;
-
-    if opts.use_cache {
-        let _ = cache::put(
-            url,
-            &CachedFetch {
-                fetched_at: cache::now(),
-                final_url: fetched.final_url.clone(),
-                status: fetched.status,
-                content_type: fetched.content_type.clone(),
-                html: fetched.html.clone(),
-                raw_bytes: fetched.raw_bytes,
-            },
-        );
-    }
-
-    Ok(fetched)
 }
 
 /// Extract the outer HTML of every element matching a CSS selector.
@@ -314,4 +385,12 @@ fn select_html(html: &str, sel: &str) -> Result<String> {
         bail!("selector '{sel}' matched no elements");
     }
     Ok(out)
+}
+
+fn js_mode_label(mode: JsMode) -> &'static str {
+    match mode {
+        JsMode::Off => "off",
+        JsMode::Auto => "auto",
+        JsMode::Always => "always",
+    }
 }

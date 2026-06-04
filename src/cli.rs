@@ -42,6 +42,10 @@ pub struct FetchArgs {
     #[arg(long, default_value_t = 20)]
     pub timeout: u64,
 
+    /// Maximum response bytes to keep before decoding.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    pub max_bytes: usize,
+
     /// Skip the on-disk cache (always fetch fresh).
     #[arg(long)]
     pub no_cache: bool,

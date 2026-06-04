@@ -5,17 +5,30 @@
 //! Edge — both are Chromium), let it run the JS, and capture the rendered DOM.
 //! The lean HTTP path stays the default; this is strictly a fallback.
 
+#[cfg(feature = "js")]
 use std::path::Path;
+#[cfg(feature = "js")]
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "js")]
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "js")]
+use anyhow::Context;
+use anyhow::{Result, bail};
+#[cfg(feature = "js")]
 use futures::{SinkExt, StreamExt};
+#[cfg(feature = "js")]
 use serde_json::{Value, json};
+#[cfg(feature = "js")]
 use tokio::net::TcpStream;
+#[cfg(feature = "js")]
 use tokio::process::Command;
+#[cfg(feature = "js")]
 use tokio::time::timeout;
+#[cfg(feature = "js")]
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "js")]
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 /// Below this many characters of extracted text, an Auto-mode page is a
@@ -46,6 +59,7 @@ pub fn looks_like_js_app(html: &str) -> bool {
 }
 
 /// Locate a Chrome/Chromium/Edge executable, honouring `RUSTBROWSER_CHROME`.
+#[cfg(feature = "js")]
 fn find_chrome() -> Option<String> {
     if let Ok(p) = std::env::var("RUSTBROWSER_CHROME")
         && !p.is_empty()
@@ -73,6 +87,7 @@ fn find_chrome() -> Option<String> {
 /// Render `url` with a headless browser and return the post-JavaScript DOM.
 ///
 /// `wait` doubles as the virtual-time budget — how long to let JS run.
+#[cfg(feature = "js")]
 pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
     let chrome = find_chrome()
         .context("no Chrome/Chromium/Edge found; set RUSTBROWSER_CHROME to its full path")?;
@@ -107,12 +122,20 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
     Ok(html)
 }
 
+/// Stub used when built without the `js` feature.
+#[cfg(not(feature = "js"))]
+pub async fn render_html(_url: &str, _wait: Duration) -> Result<String> {
+    bail!("headless rendering requires the 'js' feature")
+}
+
+#[cfg(feature = "js")]
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Render `url` over the Chrome DevTools Protocol, waiting until `wait_for` (a
 /// CSS selector) appears in the DOM before capturing it. If the selector never
 /// shows up within `budget`, we capture whatever is present. Heavier than
 /// `--dump-dom`, but lets you wait for content that loads asynchronously.
+#[cfg(feature = "js")]
 pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Result<String> {
     let chrome = find_chrome()
         .context("no Chrome/Chromium/Edge found; set RUSTBROWSER_CHROME to its full path")?;
@@ -147,6 +170,13 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
     outcome
 }
 
+/// Stub used when built without the `js` feature.
+#[cfg(not(feature = "js"))]
+pub async fn render_html_cdp(_url: &str, _wait_for: &str, _budget: Duration) -> Result<String> {
+    bail!("headless rendering requires the 'js' feature")
+}
+
+#[cfg(feature = "js")]
 async fn cdp_session(
     url: &str,
     wait_for: &str,
@@ -185,6 +215,7 @@ async fn cdp_session(
 }
 
 /// Send one CDP request and return the `result` of the matching-id response.
+#[cfg(feature = "js")]
 async fn cdp_call(ws: &mut Ws, id: u64, method: &str, params: Value) -> Result<Value> {
     let req = json!({ "id": id, "method": method, "params": params });
     ws.send(Message::Text(req.to_string().into()))
@@ -202,6 +233,7 @@ async fn cdp_call(ws: &mut Ws, id: u64, method: &str, params: Value) -> Result<V
 }
 
 /// `Runtime.evaluate`, returning the JS value (by value).
+#[cfg(feature = "js")]
 async fn cdp_eval(ws: &mut Ws, id: u64, expr: &str) -> Result<Value> {
     let r = cdp_call(
         ws,
@@ -214,6 +246,7 @@ async fn cdp_eval(ws: &mut Ws, id: u64, expr: &str) -> Result<Value> {
 }
 
 /// Read the port Chrome wrote to `DevToolsActivePort` in its user-data dir.
+#[cfg(feature = "js")]
 async fn read_devtools_port(user_dir: &Path, wait: Duration) -> Result<u16> {
     let path = user_dir.join("DevToolsActivePort");
     let deadline = Instant::now() + wait;
@@ -232,6 +265,7 @@ async fn read_devtools_port(user_dir: &Path, wait: Duration) -> Result<u16> {
 }
 
 /// Ask Chrome's HTTP endpoint for the first page target's WebSocket URL.
+#[cfg(feature = "js")]
 async fn page_ws_url(port: u16) -> Result<String> {
     let url = format!("http://127.0.0.1:{port}/json/list");
     let body = reqwest::get(&url)

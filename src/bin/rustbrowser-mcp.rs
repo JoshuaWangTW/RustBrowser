@@ -53,6 +53,9 @@ struct FetchParams {
     /// Request timeout in seconds (default 20).
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Maximum response bytes to keep before decoding (default 8 MiB).
+    #[serde(default)]
+    max_bytes: Option<usize>,
     /// Skip the on-disk cache and always fetch fresh.
     #[serde(default)]
     no_cache: Option<bool>,
@@ -92,6 +95,9 @@ struct FetchManyParams {
     /// Request timeout in seconds (default 20).
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Maximum response bytes to keep before decoding (default 8 MiB).
+    #[serde(default)]
+    max_bytes: Option<usize>,
     /// Skip the on-disk cache and always fetch fresh.
     #[serde(default)]
     no_cache: Option<bool>,
@@ -133,6 +139,7 @@ fn parse_js_mode(js: Option<&str>) -> JsMode {
 #[allow(clippy::too_many_arguments)]
 fn opts_from(
     timeout_secs: Option<u64>,
+    max_bytes: Option<usize>,
     selector: Option<String>,
     stats: Option<bool>,
     no_cache: Option<bool>,
@@ -158,6 +165,7 @@ fn opts_from(
         js_mode: parse_js_mode(js),
         js_wait,
         js_wait_for,
+        max_bytes: max_bytes.unwrap_or(8 * 1024 * 1024),
     }
 }
 
@@ -225,6 +233,7 @@ impl RustBrowserServer {
     ) -> Result<String, rmcp::ErrorData> {
         let opts = opts_from(
             p.timeout_secs,
+            p.max_bytes,
             p.selector,
             p.stats,
             p.no_cache,
@@ -252,6 +261,7 @@ impl RustBrowserServer {
     ) -> Result<String, rmcp::ErrorData> {
         let opts = opts_from(
             p.timeout_secs,
+            p.max_bytes,
             None,
             p.stats,
             p.no_cache,

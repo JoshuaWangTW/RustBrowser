@@ -8,6 +8,14 @@
 /.mcp.json
 /.cargo/config.toml
 
+# External tool local config (e.g. Codex)
+/.codex
+
+# Personal AI-workflow notes & helpers (not part of the project)
+/AGENTS.md
+/RB_FETCH_ISSUES.md
+/scripts/install-rb-global-settings.ps1
+
 # Ad-hoc test artefacts
 /out*.md
 /stats*.txt
