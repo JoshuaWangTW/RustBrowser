@@ -80,6 +80,10 @@ struct FetchParams {
     /// Wait until this CSS selector appears before capturing (uses CDP).
     #[serde(default)]
     js_wait_for: Option<String>,
+    /// Permit loopback/localhost targets (local dev servers). Only loopback is
+    /// freed; private LAN, link-local, and cloud-metadata stay blocked.
+    #[serde(default)]
+    allow_local: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -125,6 +129,10 @@ struct FetchManyParams {
     /// Wait until this CSS selector appears before capturing (uses CDP).
     #[serde(default)]
     js_wait_for: Option<String>,
+    /// Permit loopback/localhost targets (local dev servers). Only loopback is
+    /// freed; private LAN, link-local, and cloud-metadata stay blocked.
+    #[serde(default)]
+    allow_local: Option<bool>,
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -150,6 +158,7 @@ fn opts_from(
     js: Option<&str>,
     js_wait: Option<u64>,
     js_wait_for: Option<String>,
+    allow_local: Option<bool>,
 ) -> DistillOptions {
     let links_full = links_full.unwrap_or(false);
     DistillOptions {
@@ -166,6 +175,7 @@ fn opts_from(
         js_wait,
         js_wait_for,
         max_bytes: max_bytes.unwrap_or(8 * 1024 * 1024),
+        allow_local: allow_local.unwrap_or(false),
     }
 }
 
@@ -244,6 +254,7 @@ impl RustBrowserServer {
             p.js.as_deref(),
             p.js_wait,
             p.js_wait_for,
+            p.allow_local,
         );
         let result = distill(&p.url, &opts)
             .await
@@ -272,6 +283,7 @@ impl RustBrowserServer {
             p.js.as_deref(),
             p.js_wait,
             p.js_wait_for,
+            p.allow_local,
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");

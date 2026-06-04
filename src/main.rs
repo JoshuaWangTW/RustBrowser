@@ -8,7 +8,8 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 
-use cli::{Cli, Command, FetchArgs, Format};
+use cli::{CacheAction, CacheArgs, Cli, Command, FetchArgs, Format};
+use rustbrowser::cache;
 use rustbrowser::{DistillOptions, Distilled, distill, distill_many};
 
 #[tokio::main(flavor = "current_thread")]
@@ -16,6 +17,66 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Fetch(args) => run_fetch(args).await,
+        Command::Cache(args) => {
+            run_cache(args);
+            Ok(())
+        }
+    }
+}
+
+/// Inspect or clean the on-disk cache.
+fn run_cache(args: CacheArgs) {
+    match args.action {
+        CacheAction::Info => {
+            let r = cache::report();
+            println!(
+                "fetch  : {:>5} entries  {}",
+                r.fetch_entries,
+                human_bytes(r.fetch_bytes)
+            );
+            println!(
+                "render : {:>5} entries  {}",
+                r.render_entries,
+                human_bytes(r.render_bytes)
+            );
+            println!(
+                "total  : {:>5} entries  {}",
+                r.total_entries(),
+                human_bytes(r.total_bytes())
+            );
+        }
+        CacheAction::Prune { older_than } => match cache::prune(older_than) {
+            Ok(p) => println!(
+                "pruned {} entries older than {older_than}s ({} freed)",
+                p.removed,
+                human_bytes(p.bytes)
+            ),
+            Err(e) => eprintln!("prune failed: {e}"),
+        },
+        CacheAction::Clear => match cache::clear() {
+            Ok(p) => println!(
+                "cleared {} entries ({} freed)",
+                p.removed,
+                human_bytes(p.bytes)
+            ),
+            Err(e) => eprintln!("clear failed: {e}"),
+        },
+    }
+}
+
+/// Human-readable byte size (binary units).
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }
 
@@ -38,6 +99,7 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         js_wait: args.js_wait,
         js_wait_for: args.js_wait_for.clone(),
         max_bytes: args.max_bytes,
+        allow_local: args.allow_local,
     };
 
     if args.urls.len() == 1 {

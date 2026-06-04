@@ -18,6 +18,28 @@ pub struct Cli {
 pub enum Command {
     /// Fetch one or more URLs and output distilled content.
     Fetch(FetchArgs),
+    /// Inspect or clean the on-disk cache.
+    Cache(CacheArgs),
+}
+
+#[derive(Args)]
+pub struct CacheArgs {
+    #[command(subcommand)]
+    pub action: CacheAction,
+}
+
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Show cache entry counts and total size.
+    Info,
+    /// Remove entries older than the given age.
+    Prune {
+        /// Age threshold in seconds; entries older than this are removed.
+        #[arg(long, default_value_t = 3600)]
+        older_than: u64,
+    },
+    /// Remove all cached entries (both fetch and render).
+    Clear,
 }
 
 #[derive(Args)]
@@ -81,6 +103,12 @@ pub struct FetchArgs {
     /// Wait until this CSS selector appears before capturing (uses CDP).
     #[arg(long)]
     pub js_wait_for: Option<String>,
+
+    /// Permit loopback/localhost targets (e.g. http://127.0.0.1:8080) — for
+    /// local dev servers. Only loopback is freed; private LAN, link-local, and
+    /// cloud-metadata addresses stay blocked.
+    #[arg(long)]
+    pub allow_local: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
