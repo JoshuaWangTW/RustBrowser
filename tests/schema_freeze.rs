@@ -29,6 +29,8 @@ const FETCH_FLAGS: &[&str] = &[
     "--per-host-concurrency",
     "--rate-limit",
     "--respect-robots",
+    "--actions",
+    "--max-actions",
 ];
 
 /// Run the built `rustbrowser` binary and capture combined stdout+stderr.

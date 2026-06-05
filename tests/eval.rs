@@ -157,3 +157,112 @@ fn every_fixture_yields_a_title_and_content() {
         );
     }
 }
+
+const ACTIONABLE: &str = include_str!("fixtures/actionable.html");
+const ACTIONABLE_BASE: &str = "https://lib.example.com/library";
+
+fn observe_opts() -> DistillOptions {
+    DistillOptions {
+        extract_actions: true,
+        diagnostics: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn observe_extracts_links_forms_buttons_downloads() {
+    let d = distill_html(ACTIONABLE, ACTIONABLE_BASE, &observe_opts()).unwrap();
+    let a = d.actions.expect("actions requested");
+
+    // Downloads are split out from ordinary links.
+    assert_eq!(a.downloads.len(), 2, "expected pdf + csv downloads");
+    assert!(
+        a.downloads
+            .iter()
+            .any(|x| x.filename.as_deref() == Some("q1-report.pdf"))
+    );
+    assert!(
+        a.downloads
+            .iter()
+            .any(|x| x.filename.as_deref() == Some("library.csv"))
+    );
+
+    // Nav/pagination/footer links survive; the file links do not appear here.
+    assert!(a.links.iter().any(|l| l.href.ends_with("/account")));
+    assert!(a.links.iter().any(|l| l.text == "Next"));
+    assert!(
+        !a.links.iter().any(|l| l.href.contains(".pdf")),
+        "download leaked into links"
+    );
+    assert_eq!(a.links[0].action_id, "link_0");
+
+    // Two submittable forms with correct method, action, fields, submit id.
+    assert_eq!(a.forms.len(), 2);
+    let search = &a.forms[0];
+    assert_eq!(search.method, "GET");
+    assert!(search.action.ends_with("/search"));
+    assert_eq!(search.submit_id, "form_0.submit");
+    assert!(search.fields.iter().any(|f| f.name == "q"));
+    assert!(
+        search
+            .fields
+            .iter()
+            .any(|f| f.kind == "select" && f.options == vec!["All", "Reports", "Guides"]),
+        "select options not captured"
+    );
+
+    let login = &a.forms[1];
+    assert_eq!(login.method, "POST");
+    assert!(login.action.ends_with("/login"));
+    assert_eq!(login.submit_id, "form_1.submit");
+    assert!(
+        login
+            .fields
+            .iter()
+            .any(|f| f.name == "csrf_token" && f.value.as_deref() == Some("tok_9f8e")),
+        "hidden csrf value not captured"
+    );
+    assert!(
+        login
+            .fields
+            .iter()
+            .any(|f| f.name == "password" && f.kind == "password")
+    );
+
+    // Only the standalone button — form submit buttons belong to their forms.
+    assert_eq!(a.buttons.len(), 1);
+    assert_eq!(a.buttons[0].text, "Load more results");
+
+    // Diagnostics action_count matches the tree total.
+    assert_eq!(d.diagnostics.unwrap().action_count, a.len());
+}
+
+#[test]
+fn action_ids_are_stable_across_runs() {
+    let first = distill_html(ACTIONABLE, ACTIONABLE_BASE, &observe_opts())
+        .unwrap()
+        .actions
+        .unwrap();
+    let second = distill_html(ACTIONABLE, ACTIONABLE_BASE, &observe_opts())
+        .unwrap()
+        .actions
+        .unwrap();
+    let ids = |t: &rustbrowser::actions::ActionTree| -> Vec<String> {
+        t.links.iter().map(|l| l.action_id.clone()).collect()
+    };
+    assert_eq!(ids(&first), ids(&second));
+    assert_eq!(first.forms[0].submit_id, "form_0.submit");
+}
+
+#[test]
+fn max_actions_caps_the_tree() {
+    let mut o = observe_opts();
+    o.max_actions = Some(2);
+    let a = distill_html(ACTIONABLE, ACTIONABLE_BASE, &o)
+        .unwrap()
+        .actions
+        .unwrap();
+    assert!(a.links.len() <= 2, "links not capped: {}", a.links.len());
+    assert!(a.forms.len() <= 2);
+    assert!(a.downloads.len() <= 2);
+}

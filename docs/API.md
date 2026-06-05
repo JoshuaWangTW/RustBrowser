@@ -36,6 +36,8 @@ Positional: one or more URLs (multiple are fetched concurrently as a batch).
 | `--per-host-concurrency` | integer | `4` | Max simultaneous requests per host (0 = unlimited). |
 | `--rate-limit` | requests/sec | `0` | Per-host rate limit (0 = off). |
 | `--respect-robots` | flag | off | Honour each host's robots.txt. |
+| `--actions` | flag | off | Extract the operable action tree (links/forms/buttons/downloads). |
+| `--max-actions` | integer | — | Cap each action category at this many entries. |
 
 ### `rustbrowser cache <action>`
 
@@ -49,7 +51,7 @@ Exit code is non-zero if a `prune`/`clear` operation fails.
 
 ## MCP tools
 
-The `rustbrowser-mcp` stdio server exposes two tools.
+The `rustbrowser-mcp` stdio server exposes three tools.
 
 ### `fetch_url`
 
@@ -77,6 +79,15 @@ The `rustbrowser-mcp` stdio server exposes two tools.
 | `per_host_concurrency` | integer | `4` |
 | `rate_limit` | number (req/sec) | `0` |
 | `respect_robots` | bool | `false` |
+| `extract_actions` | bool | `false` |
+| `max_actions` | integer | — |
+
+### `observe_url`
+
+Takes the **same parameters as `fetch_url`**. Always extracts the action tree
+and diagnostics, and always returns JSON (`Distilled` with `actions`). Use it
+to learn what is *operable* on a page (links/forms/buttons/downloads, each with
+a stable `action_id`) for a Browser-Use loop.
 
 ### `fetch_urls`
 
@@ -103,7 +114,8 @@ are omitted when absent.
 | `stats` | object? | `{raw_bytes, raw_tokens, output_tokens, saved_tokens, saved_ratio}` — present with `stats`. |
 | `links` | array? | `{href, text}` — present with link extraction. |
 | `tables` | array? | `{headers, rows}` — present with table extraction. |
-| `diagnostics` | object? | `{profile, raw_bytes, output_chars, output_tokens, extraction_ratio, link_count, table_count, used_headless, truncated, low_content}` — present with `diagnostics`. |
+| `actions` | object? | `{links, forms, buttons, downloads}` — present with action extraction. Each entry has a stable `action_id`; forms carry `method`, `action`, `fields`, and `submit_id`. |
+| `diagnostics` | object? | `{profile, raw_bytes, output_chars, output_tokens, extraction_ratio, link_count, table_count, action_count, used_headless, truncated, low_content}` — present with `diagnostics`. |
 
 > The exact Markdown text and token numbers are **not** semver-stable — see the
 > stability policy. The field names and shapes above are.

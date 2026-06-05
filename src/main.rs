@@ -120,6 +120,8 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         },
         max_output_tokens: args.max_output_tokens,
         diagnostics: args.diagnostics,
+        extract_actions: args.actions,
+        max_actions: args.max_actions,
     };
 
     if args.urls.len() == 1 {
@@ -212,6 +214,28 @@ fn print_extras(result: &Distilled, format: Format) {
             for row in &t.rows {
                 println!("| {} |", row.join(" | "));
             }
+        }
+    }
+    if let Some(a) = &result.actions {
+        println!("\n## Actions ({})", a.len());
+        for l in &a.links {
+            println!("- [{}] {} → {}", l.action_id, l.text, l.href);
+        }
+        for f in &a.forms {
+            println!(
+                "- [{}] form {} {} ({} fields, submit={})",
+                f.action_id,
+                f.method,
+                f.action,
+                f.fields.len(),
+                f.submit_id
+            );
+        }
+        for b in &a.buttons {
+            println!("- [{}] button: {}", b.action_id, b.text);
+        }
+        for d in &a.downloads {
+            println!("- [{}] download: {} → {}", d.action_id, d.text, d.href);
         }
     }
 }

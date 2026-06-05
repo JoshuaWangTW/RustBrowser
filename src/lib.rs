@@ -4,6 +4,7 @@
 //! CLI today and an MCP server tomorrow. The whole point is to turn a heavy
 //! HTML page into the minimal token footprint an LLM actually needs.
 
+pub mod actions;
 pub mod budget;
 pub mod cache;
 pub mod convert;
@@ -22,6 +23,7 @@ use futures::stream::{self, StreamExt};
 use scraper::{Html, Selector};
 use serde::Serialize;
 
+use crate::actions::{ActionLimits, ActionTree};
 use crate::cache::{CachedFetch, CachedRender};
 use crate::fetch::{FetchOptions, FetchResult, Fetcher};
 use crate::structured::{Link, Table};
@@ -114,6 +116,11 @@ pub struct DistillOptions {
     pub max_output_tokens: Option<usize>,
     /// Compute and attach extraction-quality `Diagnostics` to the result.
     pub diagnostics: bool,
+    /// Extract the operable action tree (links/forms/buttons/downloads).
+    pub extract_actions: bool,
+    /// Cap each action category at this many entries (None = sensible defaults),
+    /// keeping the action tree from exploding on huge pages.
+    pub max_actions: Option<usize>,
 }
 
 impl Default for DistillOptions {
@@ -140,6 +147,8 @@ impl Default for DistillOptions {
             profile: Profile::Article,
             max_output_tokens: None,
             diagnostics: false,
+            extract_actions: false,
+            max_actions: None,
         }
     }
 }
@@ -173,6 +182,8 @@ pub struct Diagnostics {
     pub link_count: usize,
     /// Structured tables extracted (0 unless table extraction was requested).
     pub table_count: usize,
+    /// Total actions in the action tree (0 unless action extraction requested).
+    pub action_count: usize,
     /// Whether headless rendering was used for this page.
     pub used_headless: bool,
     /// Whether the output was truncated to fit the token budget.
@@ -202,6 +213,9 @@ pub struct Distilled {
     pub links: Option<Vec<Link>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tables: Option<Vec<Table>>,
+    /// Operable action tree (links/forms/buttons/downloads) when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<ActionTree>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Diagnostics>,
 }
@@ -412,6 +426,16 @@ fn assemble(
         .extract_tables
         .then(|| structured::extract_tables(&content.content_html));
 
+    // The action tree is page-wide (nav links, forms, …), so it runs against the
+    // full HTML, not the distilled main content.
+    let actions = opts.extract_actions.then(|| {
+        let limits = opts
+            .max_actions
+            .map(ActionLimits::uniform)
+            .unwrap_or_default();
+        actions::extract_actions(&fetched.html, &fetched.final_url, limits)
+    });
+
     let (text, text_truncated) = if content.text.is_empty() {
         (markdown.clone(), false)
     } else {
@@ -448,6 +472,7 @@ fn assemble(
             extraction_ratio: output_chars as f64 / raw_chars as f64,
             link_count: links.as_ref().map_or(0, Vec::len),
             table_count: tables.as_ref().map_or(0, Vec::len),
+            action_count: actions.as_ref().map_or(0, ActionTree::len),
             used_headless,
             truncated,
             low_content: markdown.trim().chars().count() < 200,
@@ -465,6 +490,7 @@ fn assemble(
         stats,
         links,
         tables,
+        actions,
         diagnostics,
     })
 }
