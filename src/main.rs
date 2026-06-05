@@ -164,6 +164,8 @@ async fn run_batch(args: &FetchArgs, opts: &DistillOptions) {
                 println!("<!-- {url} -->");
                 print_result(d, args.format);
                 print_extras(d, args.format);
+                print_stats(d);
+                print_diagnostics(d);
             }
             Err(e) => eprintln!("✗ {url}: {e}"),
         }

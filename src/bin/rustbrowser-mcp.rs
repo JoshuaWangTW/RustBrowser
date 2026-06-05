@@ -102,7 +102,7 @@ struct FetchParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to the result (default false).
@@ -173,7 +173,7 @@ struct FetchManyParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to each result (default false).

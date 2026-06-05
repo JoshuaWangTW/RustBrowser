@@ -109,7 +109,7 @@ pub struct DistillOptions {
     pub respect_robots: bool,
     /// Content-selection profile (ignored when `selector` is set).
     pub profile: Profile,
-    /// If set, truncate the Markdown output to fit this many tokens (at a
+    /// If set, truncate the Markdown/text output to fit this many tokens (at a
     /// paragraph boundary, with a marker). `None` = no limit.
     pub max_output_tokens: Option<usize>,
     /// Compute and attach extraction-quality `Diagnostics` to the result.
@@ -392,8 +392,8 @@ fn assemble(
 ) -> Result<Distilled> {
     let markdown = convert::to_markdown(&content.content_html)?;
 
-    // Token budget: truncate the Markdown to fit, if a limit was requested.
-    let (markdown, truncated) = match opts.max_output_tokens {
+    // Token budget: truncate rendered output to fit, if a limit was requested.
+    let (markdown, markdown_truncated) = match opts.max_output_tokens {
         Some(max) => budget::fit(&markdown, max),
         None => (markdown, false),
     };
@@ -412,11 +412,15 @@ fn assemble(
         .extract_tables
         .then(|| structured::extract_tables(&content.content_html));
 
-    let text = if content.text.is_empty() {
-        markdown.clone()
+    let (text, text_truncated) = if content.text.is_empty() {
+        (markdown.clone(), false)
     } else {
-        content.text.clone()
+        match opts.max_output_tokens {
+            Some(max) => budget::fit(&content.text, max),
+            None => (content.text.clone(), false),
+        }
     };
+    let truncated = markdown_truncated || text_truncated;
 
     let stats = opts.measure_tokens.then(|| {
         let ts = TokenStats::measure(&fetched.html, &markdown);

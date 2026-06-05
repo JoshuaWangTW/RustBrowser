@@ -5,7 +5,7 @@
 //! content survives, chrome is stripped, profiles behave distinctly, and token
 //! savings clear a floor. This is the regression net for extraction quality.
 
-use rustbrowser::{DistillOptions, Profile, distill_html};
+use rustbrowser::{DistillOptions, Profile, distill_html, tokens};
 
 const ARTICLE: &str = include_str!("fixtures/article.html");
 const DOCS: &str = include_str!("fixtures/docs.html");
@@ -130,6 +130,11 @@ fn token_budget_truncates_and_flags_diagnostics() {
         d.markdown.contains("truncated"),
         "missing truncation marker"
     );
+    assert!(
+        tokens::count(&d.markdown) <= 20,
+        "markdown exceeded token budget"
+    );
+    assert!(tokens::count(&d.text) <= 20, "text exceeded token budget");
     let diag = d.diagnostics.expect("diagnostics requested");
     assert!(diag.truncated, "diagnostics should flag truncation");
     assert_eq!(diag.profile, "article");

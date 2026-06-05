@@ -10,7 +10,11 @@ use crate::tokens;
 /// Appended to truncated output so the consumer knows content was dropped.
 pub const TRUNCATION_MARKER: &str = "\n\n…(truncated to fit token budget)";
 
-/// Fit `markdown` within `max_tokens`, truncating at paragraph boundaries.
+const MARKER_FALLBACKS: [&str; 5] = [TRUNCATION_MARKER, "\n\n…(truncated)", "\n\n…", "…", ""];
+
+/// Fit `markdown` within `max_tokens`, truncating at paragraph boundaries when
+/// possible and falling back to a bounded prefix when a single paragraph is too
+/// large. The truncation marker is counted inside the budget.
 /// Returns the (possibly truncated) text and whether truncation occurred. A
 /// `max_tokens` of 0 means "no budget" and passes the text through untouched.
 pub fn fit(markdown: &str, max_tokens: usize) -> (String, bool) {
@@ -18,31 +22,91 @@ pub fn fit(markdown: &str, max_tokens: usize) -> (String, bool) {
         return (markdown.to_string(), false);
     }
 
+    let marker = marker_for(max_tokens);
     let mut out = String::new();
-    let mut used = 0usize;
     for para in markdown.split("\n\n") {
         let para = para.trim_end();
         if para.is_empty() {
             continue;
         }
-        let cost = tokens::count(para);
-        // Always keep the first paragraph even if it alone blows the budget —
-        // returning nothing is worse than a slight overshoot.
-        if !out.is_empty() && used + cost > max_tokens {
-            break;
+
+        let candidate = append_paragraph(&out, para);
+        if fits(&candidate, marker, max_tokens) {
+            out = candidate;
+            continue;
         }
-        if !out.is_empty() {
-            out.push_str("\n\n");
+
+        if out.is_empty() {
+            out = bounded_prefix(para, marker, max_tokens);
         }
+        break;
+    }
+
+    if out.is_empty() {
+        out = bounded_prefix(markdown.trim_end(), marker, max_tokens);
+    }
+
+    let mut final_out = out;
+    final_out.push_str(marker);
+    if tokens::count(&final_out) <= max_tokens {
+        (final_out, true)
+    } else {
+        let marker_only = marker_for(max_tokens).to_string();
+        debug_assert!(tokens::count(&marker_only) <= max_tokens);
+        (marker_only, true)
+    }
+}
+
+fn marker_for(max_tokens: usize) -> &'static str {
+    MARKER_FALLBACKS
+        .iter()
+        .copied()
+        .find(|marker| tokens::count(marker) <= max_tokens)
+        .unwrap_or("")
+}
+
+fn append_paragraph(existing: &str, para: &str) -> String {
+    if existing.is_empty() {
+        para.to_string()
+    } else {
+        let mut out = String::with_capacity(existing.len() + para.len() + 2);
+        out.push_str(existing);
+        out.push_str("\n\n");
         out.push_str(para);
-        used += cost;
-        if used >= max_tokens {
-            break;
+        out
+    }
+}
+
+fn fits(body: &str, marker: &str, max_tokens: usize) -> bool {
+    let mut candidate = String::with_capacity(body.len() + marker.len());
+    candidate.push_str(body);
+    candidate.push_str(marker);
+    tokens::count(&candidate) <= max_tokens
+}
+
+fn bounded_prefix(text: &str, marker: &str, max_tokens: usize) -> String {
+    let text = text.trim_end();
+    if text.is_empty() || tokens::count(marker) > max_tokens {
+        return String::new();
+    }
+
+    let mut boundaries = vec![0usize];
+    boundaries.extend(text.char_indices().skip(1).map(|(idx, _)| idx));
+    boundaries.push(text.len());
+
+    let mut low = 0usize;
+    let mut high = boundaries.len() - 1;
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let prefix = text[..boundaries[mid]].trim_end();
+        if fits(prefix, marker, max_tokens) {
+            low = mid;
+        } else {
+            high = mid - 1;
         }
     }
 
-    out.push_str(TRUNCATION_MARKER);
-    (out, true)
+    text[..boundaries[low]].trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -74,15 +138,24 @@ mod tests {
         assert!(truncated);
         assert!(out.contains("truncated"));
         assert!(out.starts_with("Paragraph 0"));
+        assert!(tokens::count(&out) <= 20);
         assert!(tokens::count(&out) < tokens::count(&md));
     }
 
     #[test]
-    fn keeps_first_paragraph_even_if_oversized() {
+    fn oversized_first_paragraph_respects_budget() {
         let big = "word ".repeat(500);
         let (out, truncated) = fit(&big, 5);
         assert!(truncated);
-        // The single oversized paragraph is retained rather than dropped.
-        assert!(out.starts_with("word word"));
+        assert!(tokens::count(&out) <= 5);
+        assert!(out.starts_with("word") || out.starts_with('…'));
+    }
+
+    #[test]
+    fn tiny_budget_still_respects_budget() {
+        let big = "word ".repeat(20);
+        let (out, truncated) = fit(&big, 1);
+        assert!(truncated);
+        assert!(tokens::count(&out) <= 1);
     }
 }

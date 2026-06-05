@@ -133,12 +133,12 @@ pub struct FetchArgs {
     #[arg(long, value_enum, default_value_t = Profile::Article)]
     pub profile: Profile,
 
-    /// Truncate the Markdown output to fit this many tokens (at a paragraph
+    /// Truncate the Markdown/text output to fit this many tokens (at a paragraph
     /// boundary, with a marker). Unset = no limit.
     #[arg(long)]
     pub max_output_tokens: Option<usize>,
 
-    /// Print extraction-quality diagnostics to stderr (always in --format json).
+    /// Print extraction-quality diagnostics to stderr (included in JSON output).
     #[arg(long)]
     pub diagnostics: bool,
 }
