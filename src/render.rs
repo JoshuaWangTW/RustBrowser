@@ -163,6 +163,19 @@ where
     Ok(buf)
 }
 
+#[cfg(feature = "js")]
+fn cdp_byte_capped_outer_html_expr(max: usize) -> String {
+    format!(
+        r#"(() => {{
+const html = document.documentElement.outerHTML;
+const encoder = new TextEncoder();
+const bytes = encoder.encode(html);
+const capped = bytes.length > {max} ? bytes.slice(0, {max}) : bytes;
+return new TextDecoder("utf-8", {{ fatal: false }}).decode(capped);
+}})()"#
+    )
+}
+
 /// Render `url` with a headless browser and return the post-JavaScript DOM.
 ///
 /// `wait` doubles as the virtual-time budget — how long to let JS run.
@@ -200,8 +213,17 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
     .context("headless render timed out")?
     .context("reading headless DOM")?;
 
-    // We have what we need; reap the browser (kill_on_drop covers early returns).
-    let _ = child.kill().await;
+    let hit_cap = bytes.len() == MAX_RENDER_BYTES;
+    if hit_cap {
+        // We intentionally stop reading once the cap is reached; kill Chrome so
+        // it cannot keep writing a huge DOM into the pipe.
+        let _ = child.kill().await;
+    } else {
+        let status = child.wait().await.context("waiting for headless browser")?;
+        if !status.success() {
+            bail!("headless browser exited unsuccessfully");
+        }
+    }
 
     let html = String::from_utf8_lossy(&bytes).into_owned();
     if html.trim().is_empty() {
@@ -292,10 +314,9 @@ async fn cdp_session(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Slice in the browser so the CDP payload itself is bounded — we never pull
-    // more than the cap over the WebSocket. `cap_dom` is a byte-level backstop on
-    // top (JS `slice` counts UTF-16 units, not bytes).
-    let expr = format!("document.documentElement.outerHTML.slice(0, {MAX_RENDER_BYTES})");
+    // Cap by UTF-8 bytes in the browser so the CDP payload itself is bounded.
+    // `cap_dom` remains a byte-level backstop after JSON decoding.
+    let expr = cdp_byte_capped_outer_html_expr(MAX_RENDER_BYTES);
     let dom = cdp_eval(&mut ws, id + 1, &expr).await?;
     dom.as_str()
         .map(str::to_string)
@@ -456,6 +477,15 @@ mod tests {
         let mut src: &[u8] = &data;
         let out = read_capped(&mut src, 4096).await.unwrap();
         assert_eq!(out.len(), 1000); // whole stream fits under the cap
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn cdp_capture_expression_caps_utf8_bytes_in_browser() {
+        let expr = cdp_byte_capped_outer_html_expr(4096);
+        assert!(expr.contains("new TextEncoder()"));
+        assert!(expr.contains("bytes.slice(0, 4096)"));
+        assert!(!expr.contains("outerHTML.slice"));
     }
 
     #[cfg(feature = "js")]

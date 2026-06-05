@@ -340,6 +340,12 @@ async fn main() -> ExitCode {
     let service = match RustBrowserServer::new().serve(stdio()).await {
         Ok(service) => service,
         Err(e) => {
+            if is_clean_startup_disconnect(&e) {
+                eprintln!(
+                    "rustbrowser-mcp: client disconnected before initialization, shutting down"
+                );
+                return ExitCode::SUCCESS;
+            }
             eprintln!("rustbrowser-mcp: failed to start MCP service: {e}");
             return ExitCode::FAILURE;
         }
@@ -371,5 +377,37 @@ async fn main() -> ExitCode {
             eprintln!("rustbrowser-mcp: transport error while serving: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn is_clean_startup_disconnect(e: &impl std::fmt::Display) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("connection closed") && msg.contains("initialize request")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DisplayErr(&'static str);
+
+    impl std::fmt::Display for DisplayErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    #[test]
+    fn startup_initialize_eof_is_clean_disconnect() {
+        assert!(is_clean_startup_disconnect(&DisplayErr(
+            "connection closed: initialize request"
+        )));
+    }
+
+    #[test]
+    fn unrelated_startup_error_is_not_clean_disconnect() {
+        assert!(!is_clean_startup_disconnect(&DisplayErr(
+            "failed to bind stdio transport"
+        )));
     }
 }
