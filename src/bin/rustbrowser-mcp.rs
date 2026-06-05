@@ -20,7 +20,7 @@ use rmcp::{
 use serde::Deserialize;
 use serde_json::json;
 
-use rustbrowser::{DistillOptions, Distilled, JsMode, distill, distill_many};
+use rustbrowser::{DistillOptions, Distilled, JsMode, Profile, distill, distill_many};
 
 #[derive(Debug, Clone)]
 struct RustBrowserServer {
@@ -99,6 +99,15 @@ struct FetchParams {
     /// Respect each host's robots.txt and skip disallowed paths (default false).
     #[serde(default)]
     respect_robots: Option<bool>,
+    /// Content profile: "article" (default), "full" (whole body), or "metadata".
+    #[serde(default)]
+    profile: Option<String>,
+    /// Truncate the Markdown output to fit this many tokens (default: no limit).
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    /// Attach extraction-quality diagnostics to the result (default false).
+    #[serde(default)]
+    diagnostics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -161,6 +170,15 @@ struct FetchManyParams {
     /// Respect each host's robots.txt and skip disallowed paths (default false).
     #[serde(default)]
     respect_robots: Option<bool>,
+    /// Content profile: "article" (default), "full" (whole body), or "metadata".
+    #[serde(default)]
+    profile: Option<String>,
+    /// Truncate the Markdown output to fit this many tokens (default: no limit).
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+    /// Attach extraction-quality diagnostics to each result (default false).
+    #[serde(default)]
+    diagnostics: Option<bool>,
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -168,6 +186,14 @@ fn parse_js_mode(js: Option<&str>) -> JsMode {
         Some("off") => JsMode::Off,
         Some("always") => JsMode::Always,
         _ => JsMode::Auto,
+    }
+}
+
+fn parse_profile(profile: Option<&str>) -> Profile {
+    match profile {
+        Some("full") => Profile::Full,
+        Some("metadata") => Profile::Metadata,
+        _ => Profile::Article,
     }
 }
 
@@ -191,6 +217,9 @@ fn opts_from(
     per_host_concurrency: Option<usize>,
     rate_limit: Option<f64>,
     respect_robots: Option<bool>,
+    profile: Option<&str>,
+    max_output_tokens: Option<usize>,
+    diagnostics: Option<bool>,
 ) -> DistillOptions {
     let links_full = links_full.unwrap_or(false);
     DistillOptions {
@@ -212,6 +241,9 @@ fn opts_from(
         per_host_concurrency: per_host_concurrency.unwrap_or(4),
         min_request_interval: rate_to_interval(rate_limit.unwrap_or(0.0)),
         respect_robots: respect_robots.unwrap_or(false),
+        profile: parse_profile(profile),
+        max_output_tokens,
+        diagnostics: diagnostics.unwrap_or(false),
     }
 }
 
@@ -304,6 +336,9 @@ impl RustBrowserServer {
             p.per_host_concurrency,
             p.rate_limit,
             p.respect_robots,
+            p.profile.as_deref(),
+            p.max_output_tokens,
+            p.diagnostics,
         );
         let result = distill(&p.url, &opts)
             .await
@@ -337,6 +372,9 @@ impl RustBrowserServer {
             p.per_host_concurrency,
             p.rate_limit,
             p.respect_robots,
+            p.profile.as_deref(),
+            p.max_output_tokens,
+            p.diagnostics,
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");

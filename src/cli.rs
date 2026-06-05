@@ -127,6 +127,31 @@ pub struct FetchArgs {
     /// Respect each host's robots.txt and skip disallowed paths.
     #[arg(long)]
     pub respect_robots: bool,
+
+    /// Content profile: article (readability, default), full (whole body, no
+    /// readability filtering), or metadata (title + short summary only).
+    #[arg(long, value_enum, default_value_t = Profile::Article)]
+    pub profile: Profile,
+
+    /// Truncate the Markdown output to fit this many tokens (at a paragraph
+    /// boundary, with a marker). Unset = no limit.
+    #[arg(long)]
+    pub max_output_tokens: Option<usize>,
+
+    /// Print extraction-quality diagnostics to stderr (always in --format json).
+    #[arg(long)]
+    pub diagnostics: bool,
+}
+
+/// Content-selection profile.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum Profile {
+    /// Readability main-content extraction (default).
+    Article,
+    /// Whole `<body>`, scripts/styles removed, no readability filtering.
+    Full,
+    /// Title + a short summary only.
+    Metadata,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

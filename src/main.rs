@@ -113,6 +113,13 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         per_host_concurrency: args.per_host_concurrency,
         min_request_interval: rate_to_interval(args.rate_limit),
         respect_robots: args.respect_robots,
+        profile: match args.profile {
+            cli::Profile::Article => rustbrowser::Profile::Article,
+            cli::Profile::Full => rustbrowser::Profile::Full,
+            cli::Profile::Metadata => rustbrowser::Profile::Metadata,
+        },
+        max_output_tokens: args.max_output_tokens,
+        diagnostics: args.diagnostics,
     };
 
     if args.urls.len() == 1 {
@@ -120,6 +127,7 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         print_result(&result, args.format);
         print_extras(&result, args.format);
         print_stats(&result);
+        print_diagnostics(&result);
     } else {
         run_batch(&args, &opts).await;
     }
@@ -202,6 +210,25 @@ fn print_extras(result: &Distilled, format: Format) {
             for row in &t.rows {
                 println!("| {} |", row.join(" | "));
             }
+        }
+    }
+}
+
+/// Print extraction-quality diagnostics to stderr (only when --diagnostics set).
+fn print_diagnostics(result: &Distilled) {
+    if let Some(d) = &result.diagnostics {
+        eprintln!();
+        eprintln!("── diagnostics ───────────────");
+        eprintln!("profile          : {}", d.profile);
+        eprintln!("raw bytes        : {:>8}", d.raw_bytes);
+        eprintln!("output chars     : {:>8}", d.output_chars);
+        eprintln!("output tokens    : {:>8}", d.output_tokens);
+        eprintln!("extraction ratio : {:>8.4}", d.extraction_ratio);
+        eprintln!("links / tables   : {} / {}", d.link_count, d.table_count);
+        eprintln!("headless         : {}", d.used_headless);
+        eprintln!("truncated        : {}", d.truncated);
+        if d.low_content {
+            eprintln!("⚠ low content — extraction may have failed; try --profile full");
         }
     }
 }
