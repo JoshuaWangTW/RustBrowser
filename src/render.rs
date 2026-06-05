@@ -35,6 +35,11 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 /// candidate for headless re-rendering (if it also looks like a JS app).
 pub const JS_TEXT_THRESHOLD: usize = 200;
 
+/// Hard cap on the rendered DOM we retain. Headless rendering of a hostile (or
+/// merely enormous) page could otherwise return an unbounded amount of HTML and
+/// blow up memory/tokens. 16 MiB is generous for real content.
+pub const MAX_RENDER_BYTES: usize = 16 * 1024 * 1024;
+
 /// Heuristic: does this HTML look like a client-rendered app whose real content
 /// only appears after JavaScript runs?
 pub fn looks_like_js_app(html: &str) -> bool {
@@ -84,6 +89,54 @@ fn find_chrome() -> Option<String> {
         .map(|c| c.to_string())
 }
 
+/// Parse a truthy environment-flag value (`1`/`true`/`yes`/anything non-empty
+/// that isn't `0`/`false`).
+#[cfg(feature = "js")]
+fn is_truthy_flag(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+}
+
+/// Whether to pass Chrome `--no-sandbox`. The sandbox is a primary defense when
+/// rendering untrusted web pages, so it stays ENABLED by default. Users in
+/// containers or running as root (where Chrome's sandbox can't initialize) can
+/// opt out by setting `RUSTBROWSER_NO_SANDBOX=1`.
+#[cfg(feature = "js")]
+fn no_sandbox_requested() -> bool {
+    std::env::var("RUSTBROWSER_NO_SANDBOX")
+        .map(|v| is_truthy_flag(&v))
+        .unwrap_or(false)
+}
+
+/// Headless flags shared by both render paths. Keeps the sandbox on unless
+/// explicitly opted out via `no_sandbox_requested`.
+#[cfg(feature = "js")]
+fn base_headless_args() -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--headless=new".into(),
+        "--disable-gpu".into(),
+        "--disable-dev-shm-usage".into(),
+    ];
+    if no_sandbox_requested() {
+        args.push("--no-sandbox".into());
+    }
+    args
+}
+
+/// Truncate a rendered DOM string to `MAX_RENDER_BYTES`, respecting char
+/// boundaries so the result stays valid UTF-8.
+#[cfg(feature = "js")]
+fn cap_dom(mut html: String) -> String {
+    if html.len() > MAX_RENDER_BYTES {
+        let mut end = MAX_RENDER_BYTES;
+        while end > 0 && !html.is_char_boundary(end) {
+            end -= 1;
+        }
+        html.truncate(end);
+    }
+    html
+}
+
 /// Render `url` with a headless browser and return the post-JavaScript DOM.
 ///
 /// `wait` doubles as the virtual-time budget — how long to let JS run.
@@ -93,16 +146,13 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
         .context("no Chrome/Chromium/Edge found; set RUSTBROWSER_CHROME to its full path")?;
 
     let budget = wait.as_millis().max(1000).to_string();
+    let mut args = base_headless_args();
+    args.push(format!("--virtual-time-budget={budget}"));
+    args.push("--dump-dom".into());
+    args.push(url.to_string());
+
     let run = Command::new(&chrome)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            &format!("--virtual-time-budget={budget}"),
-            "--dump-dom",
-            url,
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output();
@@ -115,7 +165,9 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
     if !out.status.success() {
         bail!("headless browser exited unsuccessfully");
     }
-    let html = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Cap before decoding so a giant DOM never materialises fully in memory.
+    let capped = &out.stdout[..out.stdout.len().min(MAX_RENDER_BYTES)];
+    let html = String::from_utf8_lossy(capped).into_owned();
     if html.trim().is_empty() {
         bail!("headless render produced an empty DOM");
     }
@@ -148,16 +200,13 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
         std::env::temp_dir().join(format!("rustbrowser-cdp-{}-{uniq}", std::process::id()));
     let _ = std::fs::create_dir_all(&user_dir);
 
+    let mut args = base_headless_args();
+    args.push("--remote-debugging-port=0".into());
+    args.push(format!("--user-data-dir={}", user_dir.display()));
+    args.push("about:blank".into());
+
     let mut child = Command::new(&chrome)
-        .args([
-            "--headless=new",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--remote-debugging-port=0",
-            &format!("--user-data-dir={}", user_dir.display()),
-            "about:blank",
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -210,6 +259,7 @@ async fn cdp_session(
     let dom = cdp_eval(&mut ws, id + 1, "document.documentElement.outerHTML").await?;
     dom.as_str()
         .map(str::to_string)
+        .map(cap_dom)
         .filter(|s| !s.trim().is_empty())
         .context("CDP render produced an empty DOM")
 }
@@ -306,5 +356,59 @@ mod tests {
         let html = "<html><head><script src=\"a.js\"></script>\
                     <script>var x = 1;</script></head><body><div></div></body></html>";
         assert!(looks_like_js_app(html));
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn truthy_flag_parsing() {
+        assert!(is_truthy_flag("1"));
+        assert!(is_truthy_flag("true"));
+        assert!(is_truthy_flag("YES"));
+        assert!(!is_truthy_flag("0"));
+        assert!(!is_truthy_flag("false"));
+        assert!(!is_truthy_flag("False"));
+        assert!(!is_truthy_flag(""));
+        assert!(!is_truthy_flag("   "));
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn base_args_keep_sandbox_by_default() {
+        // We can't safely mutate process env in parallel tests, but we can assert
+        // the static invariant: the base flags never hard-code --no-sandbox.
+        let args = base_headless_args();
+        assert!(args.iter().any(|a| a == "--headless=new"));
+        // --no-sandbox only ever appears via the explicit opt-in path.
+        assert_eq!(
+            args.iter().any(|a| a == "--no-sandbox"),
+            no_sandbox_requested()
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn cap_dom_truncates_oversized_input() {
+        let big = "a".repeat(MAX_RENDER_BYTES + 1000);
+        let capped = cap_dom(big);
+        assert!(capped.len() <= MAX_RENDER_BYTES);
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn cap_dom_passes_small_input_through() {
+        let small = "<html><body>hi</body></html>".to_string();
+        assert_eq!(cap_dom(small.clone()), small);
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn cap_dom_respects_char_boundaries() {
+        // A multi-byte char straddling the cap must not be split into invalid
+        // UTF-8 (truncation only happens past the limit; just assert validity).
+        let s = "界".repeat(MAX_RENDER_BYTES); // 3 bytes each → well over the cap
+        let capped = cap_dom(s);
+        assert!(capped.len() <= MAX_RENDER_BYTES);
+        // If it compiled to a String it is valid UTF-8; round-trip to be sure.
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
     }
 }

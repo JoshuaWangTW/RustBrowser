@@ -65,6 +65,9 @@ pub struct DistillOptions {
     pub js_wait_for: Option<String>,
     /// Hard cap on decoded response bytes retained from each HTTP response.
     pub max_bytes: usize,
+    /// Permit loopback/localhost targets (off by default). Frees only loopback;
+    /// private LAN, link-local, and cloud-metadata addresses stay blocked.
+    pub allow_local: bool,
 }
 
 impl Default for DistillOptions {
@@ -83,6 +86,7 @@ impl Default for DistillOptions {
             js_wait: None,
             js_wait_for: None,
             max_bytes: 8 * 1024 * 1024,
+            allow_local: false,
         }
     }
 }
@@ -130,6 +134,7 @@ impl BrowserCore {
         let mut fopts = FetchOptions {
             timeout: opts.timeout,
             max_bytes: opts.max_bytes,
+            allow_local: opts.allow_local,
             ..Default::default()
         };
         if let Some(ua) = &opts.user_agent {
@@ -181,7 +186,7 @@ impl BrowserCore {
                 .flatten();
 
             if let Some(cached) = rendered_cache {
-                fetch::validate_cached_url(&cached.final_url)?;
+                fetch::validate_cached_url(&cached.final_url, opts.allow_local)?;
                 fetched.final_url = cached.final_url;
                 fetched.raw_bytes = cached.raw_bytes;
                 fetched.html = cached.html;
@@ -264,7 +269,7 @@ impl BrowserCore {
     /// Fetch a URL, consulting and populating the on-disk cache when enabled.
     /// Cache writes are best-effort: a failure to cache is not a failure to fetch.
     async fn fetch_maybe_cached(&self, url: &str, opts: &DistillOptions) -> Result<FetchResult> {
-        fetch::validate_cached_url(url)?;
+        fetch::validate_cached_url(url, opts.allow_local)?;
 
         let cached = if opts.use_cache {
             cache::get(url, opts.cache_ttl)
@@ -272,7 +277,7 @@ impl BrowserCore {
             None
         };
         if let Some(c) = cached {
-            fetch::validate_cached_url(&c.final_url)?;
+            fetch::validate_cached_url(&c.final_url, opts.allow_local)?;
             return Ok(FetchResult {
                 final_url: c.final_url,
                 status: c.status,

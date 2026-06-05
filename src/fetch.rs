@@ -29,6 +29,11 @@ pub struct FetchOptions {
     pub max_bytes: usize,
     /// Follow up to this many HTTP redirects. Each hop is safety-checked.
     pub max_redirects: usize,
+    /// Permit loopback/localhost targets (off by default). Opt-in for hitting
+    /// local dev servers — and what the integration tests use to reach a mock
+    /// server on 127.0.0.1. Only loopback is freed; private LAN, link-local,
+    /// and cloud-metadata addresses stay blocked even when this is set.
+    pub allow_local: bool,
 }
 
 impl Default for FetchOptions {
@@ -38,6 +43,7 @@ impl Default for FetchOptions {
             timeout: Duration::from_secs(20),
             max_bytes: 8 * 1024 * 1024, // 8 MiB is plenty for a document page
             max_redirects: 8,
+            allow_local: false,
         }
     }
 }
@@ -76,7 +82,9 @@ impl Fetcher {
             // exact addresses we validated — no separate pre-flight lookup that a
             // rebinding/low-TTL DNS could diverge from. Set once on the shared
             // client, so it applies to every request without breaking pooling.
-            .dns_resolver(Arc::new(SafeResolver))
+            .dns_resolver(Arc::new(SafeResolver {
+                allow_local: opts.allow_local,
+            }))
             .build()
             .context("building HTTP client")?;
 
@@ -85,13 +93,14 @@ impl Fetcher {
 
     /// Fetch a URL and return its decoded body.
     pub async fn fetch(&self, url: &str) -> Result<FetchResult> {
-        let mut current = parse_and_validate_url_basics(url)?;
+        let allow_local = self.opts.allow_local;
+        let mut current = parse_and_validate_url_basics(url, allow_local)?;
 
         for redirect_count in 0..=self.opts.max_redirects {
             // First line: cheap, DNS-free checks (scheme, literal IPs, localhost).
             // The connection-layer SafeResolver is the authoritative second line
             // that screens the IPs reqwest actually dials.
-            validate_host_basics(&current)?;
+            validate_host_basics(&current, allow_local)?;
 
             let mut resp = self
                 .client
@@ -105,14 +114,14 @@ impl Fetcher {
                 if redirect_count == self.opts.max_redirects {
                     bail!("too many redirects while requesting {url}");
                 }
-                if let Some(next) = redirect_target(&current, &resp)? {
+                if let Some(next) = redirect_target(&current, &resp, allow_local)? {
                     current = next;
                     continue;
                 }
             }
 
             let final_url = resp.url().to_string();
-            validate_cached_url(&final_url)?;
+            validate_cached_url(&final_url, allow_local)?;
 
             let content_type = resp
                 .headers()
@@ -145,22 +154,22 @@ pub async fn fetch(url: &str, opts: &FetchOptions) -> Result<FetchResult> {
 /// Validate URL syntax and obvious local targets without DNS. This is used
 /// before serving cached entries so unsafe local URLs are rejected even when a
 /// previous version wrote them to disk.
-pub fn validate_cached_url(url: &str) -> Result<()> {
-    let parsed = parse_and_validate_url_basics(url)?;
-    validate_host_basics(&parsed)
+pub fn validate_cached_url(url: &str, allow_local: bool) -> Result<()> {
+    let parsed = parse_and_validate_url_basics(url, allow_local)?;
+    validate_host_basics(&parsed, allow_local)
 }
 
-fn parse_and_validate_url_basics(url: &str) -> Result<Url> {
+fn parse_and_validate_url_basics(url: &str, allow_local: bool) -> Result<Url> {
     let parsed = Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
     match parsed.scheme() {
         "http" | "https" => {}
         scheme => bail!("unsupported URL scheme '{scheme}'; only http and https are allowed"),
     }
-    validate_host_basics(&parsed)?;
+    validate_host_basics(&parsed, allow_local)?;
     Ok(parsed)
 }
 
-fn validate_host_basics(url: &Url) -> Result<()> {
+fn validate_host_basics(url: &Url, allow_local: bool) -> Result<()> {
     let host = url
         .host()
         .ok_or_else(|| anyhow!("URL must include a host"))?;
@@ -168,12 +177,13 @@ fn validate_host_basics(url: &Url) -> Result<()> {
     match host {
         Host::Domain(domain) => {
             let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
-            if normalized == "localhost" || normalized.ends_with(".localhost") {
-                bail!("refusing to fetch localhost URL");
+            let is_localhost = normalized == "localhost" || normalized.ends_with(".localhost");
+            if is_localhost && !allow_local {
+                bail!("refusing to fetch localhost URL (enable allow_local to permit)");
             }
         }
-        Host::Ipv4(ip) => validate_ip(IpAddr::V4(ip))?,
-        Host::Ipv6(ip) => validate_ip(IpAddr::V6(ip))?,
+        Host::Ipv4(ip) => check_ip(IpAddr::V4(ip), allow_local)?,
+        Host::Ipv6(ip) => check_ip(IpAddr::V6(ip), allow_local)?,
     }
 
     Ok(())
@@ -191,30 +201,38 @@ fn validate_host_basics(url: &Url) -> Result<()> {
 /// certificate validation still use the original domain — reqwest keeps the
 /// hostname and only takes the socket addresses from us.
 #[derive(Debug)]
-struct SafeResolver;
+struct SafeResolver {
+    allow_local: bool,
+}
 
 impl Resolve for SafeResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        Box::pin(resolve_safely(name))
+        Box::pin(resolve_safely(name, self.allow_local))
     }
 }
 
-async fn resolve_safely(name: Name) -> Result<Addrs, Box<dyn std::error::Error + Send + Sync>> {
+async fn resolve_safely(
+    name: Name,
+    allow_local: bool,
+) -> Result<Addrs, Box<dyn std::error::Error + Send + Sync>> {
     let host = name.as_str();
     // Port 0 is a placeholder; reqwest replaces it with the URL's real port.
     let resolved = tokio::net::lookup_host((host, 0)).await?;
-    let safe = screen_resolved_addrs(host, resolved)?;
+    let safe = screen_resolved_addrs(host, resolved, allow_local)?;
     Ok(Box::new(safe.into_iter()) as Addrs)
 }
 
-/// Keep only addresses that survive `is_blocked_ip`. Errors if every resolved
+/// Keep only addresses permitted by the policy. Errors if every resolved
 /// address is blocked, so a host that resolves solely to internal space is
 /// refused at connect time instead of silently dialing nothing.
 fn screen_resolved_addrs(
     host: &str,
     addrs: impl Iterator<Item = SocketAddr>,
+    allow_local: bool,
 ) -> std::io::Result<Vec<SocketAddr>> {
-    let safe: Vec<SocketAddr> = addrs.filter(|addr| !is_blocked_ip(addr.ip())).collect();
+    let safe: Vec<SocketAddr> = addrs
+        .filter(|addr| ip_allowed(addr.ip(), allow_local))
+        .collect();
     if safe.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -226,8 +244,18 @@ fn screen_resolved_addrs(
     Ok(safe)
 }
 
-fn validate_ip(ip: IpAddr) -> Result<()> {
-    if is_blocked_ip(ip) {
+/// Whether an IP may be connected to under the current policy. `allow_local`
+/// frees *only* loopback; private LAN, link-local, CGNAT, and metadata stay
+/// blocked so the opt-in cannot be abused to reach cloud-internal services.
+fn ip_allowed(ip: IpAddr, allow_local: bool) -> bool {
+    if allow_local && ip.is_loopback() {
+        return true;
+    }
+    !is_blocked_ip(ip)
+}
+
+fn check_ip(ip: IpAddr, allow_local: bool) -> Result<()> {
+    if !ip_allowed(ip, allow_local) {
         bail!("refusing to fetch private, local, link-local, or metadata IP address");
     }
     Ok(())
@@ -285,7 +313,11 @@ fn is_ipv6_unicast_link_local(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
-fn redirect_target(current: &Url, resp: &reqwest::Response) -> Result<Option<Url>> {
+fn redirect_target(
+    current: &Url,
+    resp: &reqwest::Response,
+    allow_local: bool,
+) -> Result<Option<Url>> {
     let Some(location) = resp.headers().get(LOCATION) else {
         return Ok(None);
     };
@@ -295,7 +327,7 @@ fn redirect_target(current: &Url, resp: &reqwest::Response) -> Result<Option<Url
     let next = current
         .join(location)
         .with_context(|| format!("invalid redirect Location: {location}"))?;
-    parse_and_validate_url_basics(next.as_str())?;
+    parse_and_validate_url_basics(next.as_str(), allow_local)?;
     Ok(Some(next))
 }
 
@@ -367,29 +399,41 @@ mod tests {
 
     #[test]
     fn rejects_non_http_schemes_and_local_hosts() {
-        assert!(validate_cached_url("file:///etc/passwd").is_err());
-        assert!(validate_cached_url("http://localhost:3000").is_err());
-        assert!(validate_cached_url("http://127.0.0.1:8080").is_err());
-        assert!(validate_cached_url("http://[::1]/").is_err());
-        assert!(validate_cached_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_cached_url("file:///etc/passwd", false).is_err());
+        assert!(validate_cached_url("http://localhost:3000", false).is_err());
+        assert!(validate_cached_url("http://127.0.0.1:8080", false).is_err());
+        assert!(validate_cached_url("http://[::1]/", false).is_err());
+        assert!(validate_cached_url("http://169.254.169.254/latest/meta-data/", false).is_err());
     }
 
     #[test]
     fn accepts_public_http_urls() {
-        assert!(validate_cached_url("https://example.com/article").is_ok());
+        assert!(validate_cached_url("https://example.com/article", false).is_ok());
     }
 
     #[test]
     fn rejects_cgnat_zero_and_nat64() {
         // CGNAT 100.64.0.0/10
-        assert!(validate_cached_url("http://100.64.0.1/").is_err());
-        assert!(validate_cached_url("http://100.127.255.254/").is_err());
+        assert!(validate_cached_url("http://100.64.0.1/", false).is_err());
+        assert!(validate_cached_url("http://100.127.255.254/", false).is_err());
         // 0.0.0.0/8 beyond 0.0.0.0 itself
-        assert!(validate_cached_url("http://0.0.0.1/").is_err());
+        assert!(validate_cached_url("http://0.0.0.1/", false).is_err());
         // NAT64 64:ff9b::/96 embedding 127.0.0.1
-        assert!(validate_cached_url("http://[64:ff9b::7f00:1]/").is_err());
+        assert!(validate_cached_url("http://[64:ff9b::7f00:1]/", false).is_err());
         // A normal public IP in the 100.x but outside CGNAT stays allowed.
-        assert!(validate_cached_url("http://100.0.0.1/").is_ok());
+        assert!(validate_cached_url("http://100.0.0.1/", false).is_ok());
+    }
+
+    #[test]
+    fn allow_local_frees_only_loopback() {
+        // With allow_local, loopback + localhost become reachable…
+        assert!(validate_cached_url("http://127.0.0.1:8080", true).is_ok());
+        assert!(validate_cached_url("http://localhost:3000", true).is_ok());
+        assert!(validate_cached_url("http://[::1]/", true).is_ok());
+        // …but private LAN and cloud metadata stay blocked even then.
+        assert!(validate_cached_url("http://10.0.0.1/", true).is_err());
+        assert!(validate_cached_url("http://192.168.1.1/", true).is_err());
+        assert!(validate_cached_url("http://169.254.169.254/", true).is_err());
     }
 
     #[test]
@@ -400,7 +444,7 @@ mod tests {
             SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 0)),
             SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5), 0)),
         ];
-        assert!(screen_resolved_addrs("evil.example", blocked.into_iter()).is_err());
+        assert!(screen_resolved_addrs("evil.example", blocked.into_iter(), false).is_err());
     }
 
     #[test]
@@ -408,8 +452,18 @@ mod tests {
         // Mixed resolution: internal addresses are dropped, public ones survive.
         let public = SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 0));
         let mixed = [SocketAddr::from((Ipv4Addr::new(192, 168, 1, 1), 0)), public];
-        let safe = screen_resolved_addrs("mixed.example", mixed.into_iter()).unwrap();
+        let safe = screen_resolved_addrs("mixed.example", mixed.into_iter(), false).unwrap();
         assert_eq!(safe, vec![public]);
+    }
+
+    #[test]
+    fn screen_resolved_addrs_allow_local_keeps_loopback() {
+        let loopback = SocketAddr::from((Ipv4Addr::new(127, 0, 0, 1), 0));
+        let safe = screen_resolved_addrs("local.test", [loopback].into_iter(), true).unwrap();
+        assert_eq!(safe, vec![loopback]);
+        // metadata is still dropped even with allow_local
+        let meta = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 0));
+        assert!(screen_resolved_addrs("meta.test", [meta].into_iter(), true).is_err());
     }
 
     #[tokio::test]
@@ -417,22 +471,43 @@ mod tests {
         // A private/metadata IP literal resolves locally (no network) and must be
         // refused — this is the exact path reqwest drives at connect time.
         let loopback: Name = "127.0.0.1".parse().unwrap();
-        assert!(SafeResolver.resolve(loopback).await.is_err());
+        assert!(
+            SafeResolver { allow_local: false }
+                .resolve(loopback)
+                .await
+                .is_err()
+        );
 
         let metadata: Name = "169.254.169.254".parse().unwrap();
-        assert!(SafeResolver.resolve(metadata).await.is_err());
+        assert!(
+            SafeResolver { allow_local: false }
+                .resolve(metadata)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn safe_resolver_allows_public_ip() {
         let name: Name = "8.8.8.8".parse().unwrap();
-        let addrs: Vec<SocketAddr> = SafeResolver
+        let addrs: Vec<SocketAddr> = SafeResolver { allow_local: false }
             .resolve(name)
             .await
             .expect("public IP must pass screening")
             .collect();
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[tokio::test]
+    async fn safe_resolver_allow_local_permits_loopback() {
+        let name: Name = "127.0.0.1".parse().unwrap();
+        let addrs: Vec<SocketAddr> = SafeResolver { allow_local: true }
+            .resolve(name)
+            .await
+            .expect("loopback must pass with allow_local")
+            .collect();
+        assert_eq!(addrs[0].ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
     #[test]

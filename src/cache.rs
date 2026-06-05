@@ -4,7 +4,7 @@
 //! still be re-extracted with a different selector or format later, while
 //! JS-heavy pages avoid repeatedly launching Chrome for the same render inputs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -114,6 +114,149 @@ pub fn now() -> u64 {
     now_secs()
 }
 
+/// The cache kinds we manage on disk.
+const KINDS: [&str; 2] = ["fetch", "render"];
+
+/// What a cache-maintenance operation removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CachePurge {
+    /// Number of cache files removed.
+    pub removed: usize,
+    /// Total bytes freed.
+    pub bytes: u64,
+}
+
+/// Entry counts and on-disk sizes for each cache kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheReport {
+    pub fetch_entries: usize,
+    pub fetch_bytes: u64,
+    pub render_entries: usize,
+    pub render_bytes: u64,
+}
+
+impl CacheReport {
+    pub fn total_entries(&self) -> usize {
+        self.fetch_entries + self.render_entries
+    }
+    pub fn total_bytes(&self) -> u64 {
+        self.fetch_bytes + self.render_bytes
+    }
+}
+
+/// Summarise both cache kinds: how many entries and how many bytes each holds.
+pub fn report() -> CacheReport {
+    let (fetch_entries, fetch_bytes) = cache_dir("fetch").map(|d| dir_report(&d)).unwrap_or((0, 0));
+    let (render_entries, render_bytes) = cache_dir("render")
+        .map(|d| dir_report(&d))
+        .unwrap_or((0, 0));
+    CacheReport {
+        fetch_entries,
+        fetch_bytes,
+        render_entries,
+        render_bytes,
+    }
+}
+
+/// Remove every cached entry across both kinds. Returns what was freed.
+pub fn clear() -> Result<CachePurge> {
+    purge_kinds(|_| true)
+}
+
+/// Remove entries older than `ttl_secs` — the same staleness rule `get` applies,
+/// but enacted on disk. Corrupt/unparseable entries are dropped too.
+pub fn prune(ttl_secs: u64) -> Result<CachePurge> {
+    let cutoff = now_secs().saturating_sub(ttl_secs);
+    purge_kinds(move |path| entry_is_expired(path, cutoff))
+}
+
+/// Apply `should_remove` to every kind's directory and total the results.
+fn purge_kinds(should_remove: impl Fn(&Path) -> bool) -> Result<CachePurge> {
+    let mut total = CachePurge::default();
+    for kind in KINDS {
+        if let Some(dir) = cache_dir(kind) {
+            let p = purge_dir(&dir, &should_remove)?;
+            total.removed += p.removed;
+            total.bytes += p.bytes;
+        }
+    }
+    Ok(total)
+}
+
+/// Count `*.json` cache files in `dir` and sum their sizes. Missing dir → zero.
+fn dir_report(dir: &Path) -> (usize, u64) {
+    let mut count = 0;
+    let mut bytes = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if !is_cache_file(&entry.path()) {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata()
+                && meta.is_file()
+            {
+                count += 1;
+                bytes += meta.len();
+            }
+        }
+    }
+    (count, bytes)
+}
+
+/// Remove every `*.json` file in `dir` for which `should_remove` is true. Only
+/// our own cache files are ever touched; a missing dir is a no-op.
+fn purge_dir(dir: &Path, should_remove: impl Fn(&Path) -> bool) -> Result<CachePurge> {
+    let mut purge = CachePurge::default();
+    if !dir.exists() {
+        return Ok(purge);
+    }
+    let rd =
+        std::fs::read_dir(dir).with_context(|| format!("reading cache dir {}", dir.display()))?;
+    for entry in rd {
+        let entry = entry.context("reading cache entry")?;
+        let path = entry.path();
+        if !is_cache_file(&path) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if should_remove(&path) {
+            let len = meta.len();
+            if std::fs::remove_file(&path).is_ok() {
+                purge.removed += 1;
+                purge.bytes += len;
+            }
+        }
+    }
+    Ok(purge)
+}
+
+/// Cache files are the `*.json` entries we write; never touch anything else.
+fn is_cache_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("json")
+}
+
+/// Minimal view of a cache file: just the timestamp, valid for both kinds since
+/// `fetched_at` is the first field of each.
+#[derive(Deserialize)]
+struct Stamp {
+    fetched_at: u64,
+}
+
+/// Whether the entry at `path` is older than `cutoff` (and so should be pruned).
+/// Unreadable JSON counts as expired; a transient read error leaves it in place.
+fn entry_is_expired(path: &Path, cutoff: u64) -> bool {
+    match std::fs::read(path) {
+        Ok(data) => match serde_json::from_slice::<Stamp>(&data) {
+            Ok(s) => s.fetched_at < cutoff,
+            Err(_) => true,
+        },
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +280,81 @@ mod tests {
         let c = render_identity("https://example.com", "auto", 2000, Some(".ready"));
         assert_ne!(a, b);
         assert_ne!(a, c);
+    }
+
+    /// A unique scratch directory under the OS temp dir, isolated per test so
+    /// the suite never touches the user's real cache and stays parallel-safe.
+    fn temp_subdir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rustbrowser-test-{}-{}-{tag}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dir_report_counts_only_json_files() {
+        let dir = temp_subdir("report");
+        std::fs::write(dir.join("a.json"), b"{}").unwrap();
+        std::fs::write(dir.join("b.json"), b"hello").unwrap();
+        std::fs::write(dir.join("note.txt"), b"ignore me").unwrap();
+        let (count, bytes) = dir_report(&dir);
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 2 + 5); // only the two json files
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_dir_clear_removes_only_json() {
+        let dir = temp_subdir("clear");
+        std::fs::write(dir.join("a.json"), b"{}").unwrap();
+        std::fs::write(dir.join("b.json"), b"{}").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"x").unwrap();
+        let purge = purge_dir(&dir, |_| true).unwrap();
+        assert_eq!(purge.removed, 2);
+        assert!(!dir.join("a.json").exists());
+        assert!(!dir.join("b.json").exists());
+        // Foreign files are never deleted.
+        assert!(dir.join("keep.txt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_dir_prune_removes_only_expired() {
+        let dir = temp_subdir("prune");
+        let fresh = serde_json::json!({ "fetched_at": now_secs() }).to_string();
+        let stale = serde_json::json!({ "fetched_at": 1000u64 }).to_string();
+        std::fs::write(dir.join("fresh.json"), fresh).unwrap();
+        std::fs::write(dir.join("stale.json"), stale).unwrap();
+        // Cutoff = "older than one hour".
+        let cutoff = now_secs().saturating_sub(3600);
+        let purge = purge_dir(&dir, |p| entry_is_expired(p, cutoff)).unwrap();
+        assert_eq!(purge.removed, 1);
+        assert!(dir.join("fresh.json").exists());
+        assert!(!dir.join("stale.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn entry_is_expired_treats_corrupt_as_expired() {
+        let dir = temp_subdir("corrupt");
+        let path = dir.join("bad.json");
+        std::fs::write(&path, b"not valid json").unwrap();
+        // Corrupt entry is always prunable, regardless of cutoff.
+        assert!(entry_is_expired(&path, now_secs()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_dir_missing_directory_is_noop() {
+        let dir = temp_subdir("missing");
+        std::fs::remove_dir_all(&dir).ok(); // ensure it does not exist
+        let purge = purge_dir(&dir, |_| true).unwrap();
+        assert_eq!(purge, CachePurge::default());
     }
 }
