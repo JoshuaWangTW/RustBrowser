@@ -4,6 +4,7 @@
 //! CLI today and an MCP server tomorrow. The whole point is to turn a heavy
 //! HTML page into the minimal token footprint an LLM actually needs.
 
+pub mod budget;
 pub mod cache;
 pub mod convert;
 pub mod extract;
@@ -36,6 +37,31 @@ pub enum JsMode {
     Auto,
     /// Always render with a headless browser.
     Always,
+}
+
+/// How to select content from the fetched page. A `selector` in `DistillOptions`
+/// overrides the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Profile {
+    /// Readability main-content extraction — nav/ads/footer stripped. (default)
+    #[default]
+    Article,
+    /// The whole `<body>` (scripts/styles removed) with no Readability
+    /// filtering — for pages Readability over-strips (docs, reference, layouts).
+    Full,
+    /// Title + a short summary only — the cheapest "what is this page about".
+    Metadata,
+}
+
+impl Profile {
+    /// Stable lowercase label for diagnostics/CLI.
+    pub fn label(self) -> &'static str {
+        match self {
+            Profile::Article => "article",
+            Profile::Full => "full",
+            Profile::Metadata => "metadata",
+        }
+    }
 }
 
 /// Options controlling a single distillation.
@@ -81,6 +107,13 @@ pub struct DistillOptions {
     /// Consult each host's robots.txt and refuse disallowed paths (needs the
     /// `robots` feature to enforce; off by default).
     pub respect_robots: bool,
+    /// Content-selection profile (ignored when `selector` is set).
+    pub profile: Profile,
+    /// If set, truncate the Markdown/text output to fit this many tokens (at a
+    /// paragraph boundary, with a marker). `None` = no limit.
+    pub max_output_tokens: Option<usize>,
+    /// Compute and attach extraction-quality `Diagnostics` to the result.
+    pub diagnostics: bool,
 }
 
 impl Default for DistillOptions {
@@ -104,6 +137,9 @@ impl Default for DistillOptions {
             per_host_concurrency: 4,
             min_request_interval: Duration::ZERO,
             respect_robots: false,
+            profile: Profile::Article,
+            max_output_tokens: None,
+            diagnostics: false,
         }
     }
 }
@@ -116,6 +152,34 @@ pub struct Stats {
     pub output_tokens: usize,
     pub saved_tokens: usize,
     pub saved_ratio: f64,
+}
+
+/// Extraction-quality signals — a quick health check on what the pipeline
+/// produced, so callers can spot over-stripping, empty results, or truncation.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostics {
+    /// Which content profile produced this output.
+    pub profile: &'static str,
+    /// Raw response bytes before extraction.
+    pub raw_bytes: usize,
+    /// Characters of distilled Markdown produced.
+    pub output_chars: usize,
+    /// Estimated tokens of the distilled output.
+    pub output_tokens: usize,
+    /// `output_chars` as a fraction of raw bytes — a very low value on a large
+    /// page can signal Readability over-stripped (try the `full` profile).
+    pub extraction_ratio: f64,
+    /// Structured links extracted (0 unless link extraction was requested).
+    pub link_count: usize,
+    /// Structured tables extracted (0 unless table extraction was requested).
+    pub table_count: usize,
+    /// Whether headless rendering was used for this page.
+    pub used_headless: bool,
+    /// Whether the output was truncated to fit the token budget.
+    pub truncated: bool,
+    /// Warning: the distilled output is suspiciously short — extraction may have
+    /// failed or the page may be mostly non-text.
+    pub low_content: bool,
 }
 
 /// Distilled output of a fetch.
@@ -138,6 +202,8 @@ pub struct Distilled {
     pub links: Option<Vec<Link>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tables: Option<Vec<Table>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Diagnostics>,
 }
 
 /// Reusable core pipeline. Construct one per option set to preserve HTTP
@@ -189,6 +255,7 @@ impl BrowserCore {
                 }
             }
         };
+        let mut used_headless = false;
         if needs_js {
             let budget = opts
                 .js_wait
@@ -212,6 +279,7 @@ impl BrowserCore {
                 fetched.raw_bytes = cached.raw_bytes;
                 fetched.html = cached.html;
                 content = extract_content(&fetched, opts)?;
+                used_headless = true;
             } else {
                 let rendered = match &opts.js_wait_for {
                     Some(sel) => render::render_html_cdp(&fetched.final_url, sel, budget).await,
@@ -221,6 +289,7 @@ impl BrowserCore {
                     fetched.raw_bytes = html.len();
                     fetched.html = html;
                     content = extract_content(&fetched, opts)?;
+                    used_headless = true;
 
                     if opts.use_cache {
                         let _ = cache::put_render(
@@ -237,54 +306,7 @@ impl BrowserCore {
             }
         }
 
-        let markdown = convert::to_markdown(&content.content_html)?;
-
-        // Structured extraction runs against the distilled content, so links and
-        // tables reflect the main body rather than page-wide navigation chrome.
-        let links = opts.extract_links.then(|| {
-            // Whole-page links (incl. nav) for crawling, or just the main content.
-            let scope = if opts.links_full {
-                &fetched.html
-            } else {
-                &content.content_html
-            };
-            structured::extract_links(scope, &fetched.final_url)
-        });
-        let tables = opts
-            .extract_tables
-            .then(|| structured::extract_tables(&content.content_html));
-
-        let text = if content.text.is_empty() {
-            markdown.clone()
-        } else {
-            content.text
-        };
-
-        let stats = if opts.measure_tokens {
-            let ts = TokenStats::measure(&fetched.html, &markdown);
-            Some(Stats {
-                raw_bytes: fetched.raw_bytes,
-                raw_tokens: ts.raw_tokens,
-                output_tokens: ts.output_tokens,
-                saved_tokens: ts.saved(),
-                saved_ratio: ts.saved_ratio(),
-            })
-        } else {
-            None
-        };
-
-        Ok(Distilled {
-            final_url: fetched.final_url,
-            status: fetched.status,
-            title: content.title,
-            byline: content.byline,
-            excerpt: content.excerpt,
-            markdown,
-            text,
-            stats,
-            links,
-            tables,
-        })
+        assemble(fetched, content, used_headless, opts)
     }
 
     /// Fetch a URL, consulting and populating the on-disk cache when enabled.
@@ -344,27 +366,173 @@ pub async fn distill(url: &str, opts: &DistillOptions) -> Result<Distilled> {
     BrowserCore::new(opts)?.distill(url, opts).await
 }
 
-/// Run readability (or a CSS selector) over a fetched page.
+/// Run the extraction pipeline over HTML you already hold — no network, no
+/// headless rendering, no cache. Backs the offline eval suite and is handy for
+/// distilling captured HTML. `base_url` resolves relative links.
+pub fn distill_html(html: &str, base_url: &str, opts: &DistillOptions) -> Result<Distilled> {
+    let fetched = FetchResult {
+        final_url: base_url.to_string(),
+        status: 200,
+        content_type: Some("text/html".to_string()),
+        raw_bytes: html.len(),
+        html: html.to_string(),
+    };
+    let content = extract_content(&fetched, opts)?;
+    assemble(fetched, content, false, opts)
+}
+
+/// Turn extracted content into the final `Distilled`: convert to Markdown, apply
+/// the token budget, run structured extraction, and compute stats/diagnostics.
+/// Shared by the live `distill` path and the offline `distill_html`.
+fn assemble(
+    fetched: FetchResult,
+    content: Content,
+    used_headless: bool,
+    opts: &DistillOptions,
+) -> Result<Distilled> {
+    let markdown = convert::to_markdown(&content.content_html)?;
+
+    // Token budget: truncate rendered output to fit, if a limit was requested.
+    let (markdown, markdown_truncated) = match opts.max_output_tokens {
+        Some(max) => budget::fit(&markdown, max),
+        None => (markdown, false),
+    };
+
+    // Structured extraction runs against the distilled content, so links and
+    // tables reflect the main body rather than page-wide navigation chrome.
+    let links = opts.extract_links.then(|| {
+        let scope = if opts.links_full {
+            &fetched.html
+        } else {
+            &content.content_html
+        };
+        structured::extract_links(scope, &fetched.final_url)
+    });
+    let tables = opts
+        .extract_tables
+        .then(|| structured::extract_tables(&content.content_html));
+
+    let (text, text_truncated) = if content.text.is_empty() {
+        (markdown.clone(), false)
+    } else {
+        match opts.max_output_tokens {
+            Some(max) => budget::fit(&content.text, max),
+            None => (content.text.clone(), false),
+        }
+    };
+    let truncated = markdown_truncated || text_truncated;
+
+    let stats = opts.measure_tokens.then(|| {
+        let ts = TokenStats::measure(&fetched.html, &markdown);
+        Stats {
+            raw_bytes: fetched.raw_bytes,
+            raw_tokens: ts.raw_tokens,
+            output_tokens: ts.output_tokens,
+            saved_tokens: ts.saved(),
+            saved_ratio: ts.saved_ratio(),
+        }
+    });
+
+    let diagnostics = opts.diagnostics.then(|| {
+        let output_chars = markdown.chars().count();
+        let raw_chars = fetched.html.chars().count().max(1);
+        Diagnostics {
+            profile: if opts.selector.is_some() {
+                "selector"
+            } else {
+                opts.profile.label()
+            },
+            raw_bytes: fetched.raw_bytes,
+            output_chars,
+            output_tokens: tokens::count(&markdown),
+            extraction_ratio: output_chars as f64 / raw_chars as f64,
+            link_count: links.as_ref().map_or(0, Vec::len),
+            table_count: tables.as_ref().map_or(0, Vec::len),
+            used_headless,
+            truncated,
+            low_content: markdown.trim().chars().count() < 200,
+        }
+    });
+
+    Ok(Distilled {
+        final_url: fetched.final_url,
+        status: fetched.status,
+        title: content.title,
+        byline: content.byline,
+        excerpt: content.excerpt,
+        markdown,
+        text,
+        stats,
+        links,
+        tables,
+        diagnostics,
+    })
+}
+
+/// Select content from the fetched page: an explicit CSS `selector` wins;
+/// otherwise the chosen `profile` decides.
 fn extract_content(fetched: &FetchResult, opts: &DistillOptions) -> Result<Content> {
     if let Some(sel) = &opts.selector {
         let html = select_html(&fetched.html, sel)?;
-        Ok(Content {
+        return Ok(Content {
             title: String::new(),
             byline: None,
             excerpt: None,
             content_html: html,
             text: String::new(),
-        })
-    } else {
-        let ex = extract::extract(&fetched.html, &fetched.final_url)?;
-        Ok(Content {
-            title: ex.title,
-            byline: ex.byline,
-            excerpt: ex.excerpt,
-            content_html: ex.content_html,
-            text: ex.text,
-        })
+        });
     }
+
+    match opts.profile {
+        Profile::Article => Ok(content_from(extract::extract(
+            &fetched.html,
+            &fetched.final_url,
+        )?)),
+        Profile::Full => Ok(content_from(extract::extract_whole_body(&fetched.html)?)),
+        Profile::Metadata => {
+            let ex = extract::extract(&fetched.html, &fetched.final_url)?;
+            let summary = ex
+                .excerpt
+                .clone()
+                .filter(|e| !e.trim().is_empty())
+                .unwrap_or_else(|| first_chars(&ex.text, 400));
+            Ok(Content {
+                title: ex.title,
+                byline: ex.byline,
+                excerpt: ex.excerpt,
+                content_html: format!("<p>{}</p>", escape_text(&summary)),
+                text: summary,
+            })
+        }
+    }
+}
+
+fn content_from(ex: extract::Extracted) -> Content {
+    Content {
+        title: ex.title,
+        byline: ex.byline,
+        excerpt: ex.excerpt,
+        content_html: ex.content_html,
+        text: ex.text,
+    }
+}
+
+/// First `n` characters of `s` (trimmed), with an ellipsis if it was longer.
+fn first_chars(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() > n {
+        let head: String = t.chars().take(n).collect();
+        format!("{}…", head.trim_end())
+    } else {
+        t.to_string()
+    }
+}
+
+/// Minimal HTML text escaping for content we synthesise ourselves.
+fn escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Distill many URLs concurrently, preserving input order in the results.

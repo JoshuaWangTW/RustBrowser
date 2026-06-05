@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Configuration Reference — Example Docs</title>
+</head>
+<body>
+  <nav class="sidebar" aria-label="Docs navigation">
+    <a href="/docs/intro">Sidebar link: Introduction</a>
+    <a href="/docs/install">Sidebar link: Installation</a>
+    <a href="/docs/config">Sidebar link: Configuration</a>
+  </nav>
+
+  <main>
+    <h1>Configuration Reference</h1>
+    <p>The configuration file controls how the service starts up. Every key is
+    optional; sensible defaults apply when a key is omitted. The most commonly
+    changed setting is the listen address, shown in the example below.</p>
+
+    <h2>Minimal example</h2>
+    <pre><code>[server]
+host = "0.0.0.0"
+port = 8080
+workers = 4
+</code></pre>
+
+    <p>The <code>workers</code> value should usually match the number of CPU
+    cores available to the process. Setting it far higher wastes memory on idle
+    worker state without improving throughput.</p>
+
+    <h2>Environment overrides</h2>
+    <p>Any file key can be overridden by an environment variable using the
+    <code>APP_</code> prefix. Environment values always win over the file so
+    that container deployments can stay immutable while still being tunable.</p>
+  </main>
+
+  <footer><p>Example Docs. Edit this page on GitHub.</p></footer>
+</body>
+</html>
