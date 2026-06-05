@@ -109,6 +109,24 @@ pub struct FetchArgs {
     /// cloud-metadata addresses stay blocked.
     #[arg(long)]
     pub allow_local: bool,
+
+    /// Retry transient failures (connect/timeout, 429, 5xx) this many times
+    /// with exponential backoff. 0 disables retrying.
+    #[arg(long, default_value_t = 2)]
+    pub max_retries: usize,
+
+    /// Max simultaneous requests to any single host. 0 = unlimited.
+    #[arg(long, default_value_t = 4)]
+    pub per_host_concurrency: usize,
+
+    /// Rate limit per host, in requests per second (e.g. 2 = one every 500 ms).
+    /// 0 disables rate limiting.
+    #[arg(long, default_value_t = 0.0)]
+    pub rate_limit: f64,
+
+    /// Respect each host's robots.txt and skip disallowed paths.
+    #[arg(long)]
+    pub respect_robots: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]

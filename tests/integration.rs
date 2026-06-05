@@ -11,6 +11,7 @@
 //! default.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -309,5 +310,178 @@ async fn batch_fetches_multiple_urls_in_order() {
     assert!(
         results.iter().all(|(_, r)| r.is_ok()),
         "a batch fetch failed"
+    );
+}
+
+#[tokio::test]
+async fn retries_transient_5xx_then_succeeds() {
+    let server = MockServer::start().await;
+    // First hit → 503 (served at most once, higher priority); after it is spent,
+    // the 200 mock takes over. So a single retry turns failure into success.
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string("<html><body><p>temporarily down</p></body></html>"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(ARTICLE),
+        )
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/flaky", server.uri());
+    let d = distill(&url, &local_opts())
+        .await
+        .expect("retry should win");
+    assert_eq!(d.status, 200);
+    assert!(d.markdown.contains("The Main Headline"));
+}
+
+#[tokio::test]
+async fn surfaces_final_status_after_exhausting_retries() {
+    let server = MockServer::start().await;
+    // Always 503 — after retries are spent, the status is surfaced (not an error).
+    let url = mount_get(
+        &server,
+        "/down",
+        ResponseTemplate::new(503)
+            .insert_header("Content-Type", "text/html")
+            .set_body_string("<html><body><p>still down</p></body></html>"),
+    )
+    .await;
+
+    let opts = DistillOptions {
+        selector: Some("p".into()),
+        max_retries: 1,
+        ..local_opts()
+    };
+    let d = distill(&url, &opts)
+        .await
+        .expect("503 is surfaced, not errored");
+    assert_eq!(d.status, 503);
+}
+
+#[tokio::test]
+async fn robots_txt_blocks_only_when_respected() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("User-agent: *\nDisallow: /secret"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/secret/page"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(ARTICLE),
+        )
+        .mount(&server)
+        .await;
+    let url = format!("{}/secret/page", server.uri());
+
+    // Default (respect_robots = false): the disallow is ignored, fetch succeeds.
+    let d = distill(&url, &local_opts())
+        .await
+        .expect("ignored by default");
+    assert_eq!(d.status, 200);
+
+    // Opt in: the same path is now refused by robots.txt.
+    let opts = DistillOptions {
+        respect_robots: true,
+        ..local_opts()
+    };
+    let err = distill(&url, &opts)
+        .await
+        .expect_err("respect_robots must block a Disallowed path");
+    assert!(
+        err.to_string().to_lowercase().contains("robots"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn robots_txt_blocks_disallowed_redirect_target() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("User-agent: *\nDisallow: /secret"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/secret/page"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/secret/page"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(ARTICLE),
+        )
+        .mount(&server)
+        .await;
+
+    let opts = DistillOptions {
+        respect_robots: true,
+        ..local_opts()
+    };
+    let err = distill(&format!("{}/start", server.uri()), &opts)
+        .await
+        .expect_err("redirect target must be checked against robots.txt");
+    assert!(
+        err.to_string().to_lowercase().contains("robots"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_spaces_same_host_requests() {
+    let server = MockServer::start().await;
+    let mut urls = Vec::new();
+    for p in ["/r1", "/r2", "/r3"] {
+        urls.push(
+            mount_get(
+                &server,
+                p,
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(ARTICLE),
+            )
+            .await,
+        );
+    }
+
+    // 100 ms between request starts → the third can't begin before ~200 ms.
+    let opts = DistillOptions {
+        min_request_interval: Duration::from_millis(100),
+        ..local_opts()
+    };
+    let start = Instant::now();
+    let results = distill_many(&urls, &opts, 8).await;
+    let elapsed = start.elapsed();
+
+    assert!(results.iter().all(|(_, r)| r.is_ok()));
+    // Robust lower bound: rate limiting deterministically adds spacing, so this
+    // can only fail if the limit was not applied at all.
+    assert!(
+        elapsed >= Duration::from_millis(150),
+        "elapsed {elapsed:?} — rate limit not applied"
     );
 }
