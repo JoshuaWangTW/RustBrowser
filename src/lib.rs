@@ -9,6 +9,8 @@ pub mod convert;
 pub mod extract;
 pub mod fetch;
 pub mod render;
+#[cfg(feature = "robots")]
+pub mod robots;
 pub mod structured;
 pub mod tokens;
 
@@ -68,6 +70,17 @@ pub struct DistillOptions {
     /// Permit loopback/localhost targets (off by default). Frees only loopback;
     /// private LAN, link-local, and cloud-metadata addresses stay blocked.
     pub allow_local: bool,
+    /// Retry transient failures (connect/timeout, 429, 5xx) up to this many
+    /// times with exponential backoff + jitter. 0 disables retrying.
+    pub max_retries: usize,
+    /// Cap simultaneous in-flight requests to any single host. 0 = unlimited.
+    pub per_host_concurrency: usize,
+    /// Minimum spacing between request starts to the same host (rate limit).
+    /// Zero disables it.
+    pub min_request_interval: Duration,
+    /// Consult each host's robots.txt and refuse disallowed paths (needs the
+    /// `robots` feature to enforce; off by default).
+    pub respect_robots: bool,
 }
 
 impl Default for DistillOptions {
@@ -87,6 +100,10 @@ impl Default for DistillOptions {
             js_wait_for: None,
             max_bytes: 8 * 1024 * 1024,
             allow_local: false,
+            max_retries: 2,
+            per_host_concurrency: 4,
+            min_request_interval: Duration::ZERO,
+            respect_robots: false,
         }
     }
 }
@@ -135,6 +152,10 @@ impl BrowserCore {
             timeout: opts.timeout,
             max_bytes: opts.max_bytes,
             allow_local: opts.allow_local,
+            max_retries: opts.max_retries,
+            per_host_concurrency: opts.per_host_concurrency,
+            min_request_interval: opts.min_request_interval,
+            respect_robots: opts.respect_robots,
             ..Default::default()
         };
         if let Some(ua) = &opts.user_agent {

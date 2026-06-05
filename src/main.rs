@@ -63,6 +63,16 @@ fn run_cache(args: CacheArgs) -> Result<()> {
     Ok(())
 }
 
+/// Convert a per-host rate limit in requests/second to a minimum spacing
+/// between requests. Non-positive (or absurd) rates disable rate limiting.
+fn rate_to_interval(reqs_per_sec: f64) -> Duration {
+    if reqs_per_sec.is_finite() && reqs_per_sec > 0.0 {
+        Duration::from_secs_f64(1.0 / reqs_per_sec)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Human-readable byte size (binary units).
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -99,6 +109,10 @@ async fn run_fetch(args: FetchArgs) -> Result<()> {
         js_wait_for: args.js_wait_for.clone(),
         max_bytes: args.max_bytes,
         allow_local: args.allow_local,
+        max_retries: args.max_retries,
+        per_host_concurrency: args.per_host_concurrency,
+        min_request_interval: rate_to_interval(args.rate_limit),
+        respect_robots: args.respect_robots,
     };
 
     if args.urls.len() == 1 {

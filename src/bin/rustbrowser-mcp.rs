@@ -86,6 +86,19 @@ struct FetchParams {
     /// freed; private LAN, link-local, and cloud-metadata stay blocked.
     #[serde(default)]
     allow_local: Option<bool>,
+    /// Retry transient failures (connect/timeout, 429, 5xx) this many times
+    /// with exponential backoff (default 2).
+    #[serde(default)]
+    max_retries: Option<usize>,
+    /// Max simultaneous requests to any single host (default 4; 0 = unlimited).
+    #[serde(default)]
+    per_host_concurrency: Option<usize>,
+    /// Per-host rate limit in requests/second (default 0 = off).
+    #[serde(default)]
+    rate_limit: Option<f64>,
+    /// Respect each host's robots.txt and skip disallowed paths (default false).
+    #[serde(default)]
+    respect_robots: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -135,6 +148,19 @@ struct FetchManyParams {
     /// freed; private LAN, link-local, and cloud-metadata stay blocked.
     #[serde(default)]
     allow_local: Option<bool>,
+    /// Retry transient failures (connect/timeout, 429, 5xx) this many times
+    /// with exponential backoff (default 2).
+    #[serde(default)]
+    max_retries: Option<usize>,
+    /// Max simultaneous requests to any single host (default 4; 0 = unlimited).
+    #[serde(default)]
+    per_host_concurrency: Option<usize>,
+    /// Per-host rate limit in requests/second (default 0 = off).
+    #[serde(default)]
+    rate_limit: Option<f64>,
+    /// Respect each host's robots.txt and skip disallowed paths (default false).
+    #[serde(default)]
+    respect_robots: Option<bool>,
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -161,6 +187,10 @@ fn opts_from(
     js_wait: Option<u64>,
     js_wait_for: Option<String>,
     allow_local: Option<bool>,
+    max_retries: Option<usize>,
+    per_host_concurrency: Option<usize>,
+    rate_limit: Option<f64>,
+    respect_robots: Option<bool>,
 ) -> DistillOptions {
     let links_full = links_full.unwrap_or(false);
     DistillOptions {
@@ -178,6 +208,19 @@ fn opts_from(
         js_wait_for,
         max_bytes: max_bytes.unwrap_or(8 * 1024 * 1024),
         allow_local: allow_local.unwrap_or(false),
+        max_retries: max_retries.unwrap_or(2),
+        per_host_concurrency: per_host_concurrency.unwrap_or(4),
+        min_request_interval: rate_to_interval(rate_limit.unwrap_or(0.0)),
+        respect_robots: respect_robots.unwrap_or(false),
+    }
+}
+
+/// Per-host requests/second → minimum spacing between requests (0 = off).
+fn rate_to_interval(reqs_per_sec: f64) -> Duration {
+    if reqs_per_sec.is_finite() && reqs_per_sec > 0.0 {
+        Duration::from_secs_f64(1.0 / reqs_per_sec)
+    } else {
+        Duration::ZERO
     }
 }
 
@@ -257,6 +300,10 @@ impl RustBrowserServer {
             p.js_wait,
             p.js_wait_for,
             p.allow_local,
+            p.max_retries,
+            p.per_host_concurrency,
+            p.rate_limit,
+            p.respect_robots,
         );
         let result = distill(&p.url, &opts)
             .await
@@ -286,6 +333,10 @@ impl RustBrowserServer {
             p.js_wait,
             p.js_wait_for,
             p.allow_local,
+            p.max_retries,
+            p.per_host_concurrency,
+            p.rate_limit,
+            p.respect_robots,
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");
