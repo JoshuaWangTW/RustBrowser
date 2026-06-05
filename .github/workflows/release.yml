@@ -29,6 +29,14 @@ jobs:
             target: x86_64-pc-windows-msvc
             ext: ".exe"
             archive: zip
+          - os: macos-13
+            target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+            archive: tar.gz
     steps:
       - uses: actions/checkout@v4
 
@@ -57,6 +65,17 @@ jobs:
           else
             tar czf "../rustbrowser-${{ matrix.target }}.tar.gz" *
           fi
+
+      - name: Checksum
+        shell: bash
+        run: |
+          f="rustbrowser-${{ matrix.target }}.${{ matrix.archive }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$f" > "$f.sha256"
+          else
+            shasum -a 256 "$f" > "$f.sha256"
+          fi
+          cat "$f.sha256"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2

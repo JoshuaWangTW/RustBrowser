@@ -66,7 +66,7 @@ jobs:
           check_size target/release/rustbrowser-mcp $((15 * 1024 * 1024))
 
   build-windows:
-    name: Build (Windows)
+    name: Build & Test (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -83,3 +83,24 @@ jobs:
 
       - name: Build
         run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose
+
+  build-macos:
+    name: Build & Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Test
+        run: cargo test --verbose

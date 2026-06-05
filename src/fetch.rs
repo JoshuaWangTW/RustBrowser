@@ -19,9 +19,13 @@ use tokio::time::sleep;
 use url::{Host, Url};
 
 /// Default User-Agent. A real browser-ish UA reduces the chance of being
-/// served a degraded/blocked page, while still being honest about origin.
-const DEFAULT_UA: &str =
-    "Mozilla/5.0 (compatible; RustBrowser/0.1; +https://github.com/rustbrowser)";
+/// served a degraded/blocked page, while still being honest about origin. The
+/// version tracks the crate version automatically.
+const DEFAULT_UA: &str = concat!(
+    "Mozilla/5.0 (compatible; RustBrowser/",
+    env!("CARGO_PKG_VERSION"),
+    "; +https://github.com/JoshuaWangTW/RustBrowser)"
+);
 
 /// Tunables for a fetch.
 #[derive(Debug, Clone)]

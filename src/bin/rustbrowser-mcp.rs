@@ -499,4 +499,85 @@ mod tests {
             "failed to bind stdio transport"
         )));
     }
+
+    /// Property names present in a generated JSON schema's `properties` object.
+    fn schema_props(schema: schemars::Schema) -> std::collections::BTreeSet<String> {
+        serde_json::to_value(schema)
+            .expect("schema serialises")
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    // The MCP parameter sets are frozen for 1.x (see docs/API.md). Adding a param
+    // is fine — extend the list. Removing/renaming one should fail here first.
+
+    #[test]
+    fn fetch_url_params_are_frozen() {
+        let props = schema_props(schemars::schema_for!(FetchParams));
+        for key in [
+            "url",
+            "format",
+            "selector",
+            "profile",
+            "stats",
+            "diagnostics",
+            "max_output_tokens",
+            "timeout_secs",
+            "max_bytes",
+            "no_cache",
+            "cache_ttl",
+            "extract_links",
+            "extract_tables",
+            "links_full",
+            "js",
+            "js_wait",
+            "js_wait_for",
+            "allow_local",
+            "max_retries",
+            "per_host_concurrency",
+            "rate_limit",
+            "respect_robots",
+        ] {
+            assert!(
+                props.contains(key),
+                "frozen FetchParams field {key} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn fetch_urls_params_are_frozen() {
+        let props = schema_props(schemars::schema_for!(FetchManyParams));
+        for key in [
+            "urls",
+            "concurrency",
+            "format",
+            "profile",
+            "stats",
+            "diagnostics",
+            "max_output_tokens",
+            "timeout_secs",
+            "max_bytes",
+            "no_cache",
+            "cache_ttl",
+            "extract_links",
+            "extract_tables",
+            "links_full",
+            "js",
+            "js_wait",
+            "js_wait_for",
+            "allow_local",
+            "max_retries",
+            "per_host_concurrency",
+            "rate_limit",
+            "respect_robots",
+        ] {
+            assert!(
+                props.contains(key),
+                "frozen FetchManyParams field {key} missing"
+            );
+        }
+    }
 }

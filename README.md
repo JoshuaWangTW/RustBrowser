@@ -224,6 +224,24 @@ cargo build --release --no-default-features --features "cli mcp stats js robots"
 
 CI 會執行 fmt、clippy、build、test、release build,並檢查 release binary 大小:CLI ≤ 10 MiB,MCP ≤ 15 MiB。
 
+## 穩定性與版本 (Stability & versioning)
+
+從 `1.0.0` 起,本專案遵循 [Semantic Versioning](https://semver.org/)。`1.x` 內**保證不破壞**的公開介面:
+
+- **CLI** —— `fetch` 既有旗標與 `cache` 子命令的名稱與語意。
+- **MCP** —— `fetch_url` / `fetch_urls` 工具與其參數名稱、型別。
+- **函式庫** —— `rustbrowser` crate 的公開 API(`distill`、`distill_many`、`distill_html`、`DistillOptions`、`Distilled` 等)。
+- **JSON 輸出** —— `--format json` / MCP `format=json` 之 `Distilled` 結構既有欄位。
+
+**不在 semver 保證內**(可在 minor/patch 改動):
+
+- 精確的 Markdown 文字輸出 —— 擷取與轉換的啟發法會持續改進,內容會變。
+- token 估算的絕對數值(tokenizer 是近似)。
+- 診斷欄位的新增、`low_content` 等門檻的調整。
+- 內部模組、未公開項目、磁碟快取格式。
+
+新增旗標/參數/欄位屬於相容變更(minor)。移除或改名既有者屬於破壞變更,只會在下一個 major。棄用會先在文件標記、保留至少一個 minor 週期。完整逐版變更見 [CHANGELOG.md](CHANGELOG.md);安全防護與威脅模型見 [SECURITY.md](SECURITY.md);凍結介面的完整參考見 [docs/API.md](docs/API.md)。
+
 ## 演進路徑
 
 - ✅ **v0.1(MVP)** — 核心管線 + CLI:抓取 → 萃取 → Markdown → token 統計
@@ -235,6 +253,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v0.7(穩健性)** — headless DOM cap 改串流讀取真正限制記憶體 · `cache` 失敗回傳非零 exit code · MCP transport 明確處理斷線/錯誤(乾淨關閉、診斷只進 stderr)
 - ✅ **v0.8(禮貌抓取)** — 暫時性失敗自動重試(指數退避 + `Retry-After`)· per-host 並發上限 · per-host 速率限制 · robots.txt(opt-in)
 - ✅ **v0.9(擷取品質)** — 擷取 profile(article/full/metadata)· token 預算截斷 · 品質診斷 · `distill_html` 離線管線 + 固定評測集
+- ✅ **v1.0(穩定版)** — CLI/MCP schema 凍結(+ 守門測試)· 完整安全文件(`SECURITY.md`)· semver 承諾 + `CHANGELOG.md` · CI 覆蓋 Linux/Windows/macOS · 三平台 release binaries + checksums
 
 ## 技術棧
 
