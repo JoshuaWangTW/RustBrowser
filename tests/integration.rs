@@ -414,6 +414,44 @@ async fn robots_txt_blocks_only_when_respected() {
 }
 
 #[tokio::test]
+async fn robots_txt_blocks_disallowed_redirect_target() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/robots.txt"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("User-agent: *\nDisallow: /secret"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/start"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/secret/page"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/secret/page"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(ARTICLE),
+        )
+        .mount(&server)
+        .await;
+
+    let opts = DistillOptions {
+        respect_robots: true,
+        ..local_opts()
+    };
+    let err = distill(&format!("{}/start", server.uri()), &opts)
+        .await
+        .expect_err("redirect target must be checked against robots.txt");
+    assert!(
+        err.to_string().to_lowercase().contains("robots"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn rate_limit_spaces_same_host_requests() {
     let server = MockServer::start().await;
     let mut urls = Vec::new();

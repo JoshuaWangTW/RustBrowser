@@ -131,32 +131,31 @@ impl Fetcher {
         })
     }
 
-    /// Fetch a URL and return its decoded body. Applies, in order: robots.txt
-    /// (opt-in), the per-host concurrency permit, the per-host rate limit, then
-    /// the request itself with transient-failure retries.
+    /// Fetch a URL and return its decoded body. Each actual request hop applies,
+    /// in order: robots.txt (opt-in), the per-host concurrency permit, the
+    /// per-host rate limit, then the request itself.
     pub async fn fetch(&self, url: &str) -> Result<FetchResult> {
         let allow_local = self.opts.allow_local;
         let start = parse_and_validate_url_basics(url, allow_local)?;
-        let host = host_key(&start);
-
-        // robots.txt is consulted before we take a host slot so a disallowed URL
-        // costs nothing on the gate. (No-op unless built with the `robots`
-        // feature and `respect_robots` is set.)
-        #[cfg(feature = "robots")]
-        if self.opts.respect_robots
-            && !self
-                .robots
-                .allowed(&self.client, &start, &self.opts)
-                .await?
-        {
-            bail!("blocked by robots.txt: {url}");
-        }
-
-        // Per-host concurrency permit + rate-limit spacing. The permit is held
-        // for the whole retry sequence so retries count against the host budget.
-        let _permit = self.gate.enter(&host).await;
-
         self.fetch_with_retries(url, start).await
+    }
+
+    /// Enforce robots.txt for a URL string under this fetcher's policy. This is
+    /// also used before serving cache hits so `respect_robots` cannot be bypassed
+    /// by content fetched under a looser previous policy.
+    pub async fn enforce_robots_for_url(&self, url: &str) -> Result<()> {
+        let parsed = parse_and_validate_url_basics(url, self.opts.allow_local)?;
+        self.enforce_robots(&parsed).await
+    }
+
+    async fn enforce_robots(&self, url: &Url) -> Result<()> {
+        #[cfg(not(feature = "robots"))]
+        let _ = url;
+        #[cfg(feature = "robots")]
+        if self.opts.respect_robots && !self.robots.allowed(&self.client, url, &self.opts).await? {
+            bail!("blocked by robots.txt: {}", url.as_str());
+        }
+        Ok(())
     }
 
     /// Retry wrapper around `fetch_once`: backs off on transient transport
@@ -192,6 +191,12 @@ impl Fetcher {
             // The connection-layer SafeResolver is the authoritative second line
             // that screens the IPs reqwest actually dials.
             validate_host_basics(&current, allow_local)?;
+
+            // robots.txt and host politeness are enforced per actual request URL,
+            // including redirect hops, so a redirect cannot bypass either policy.
+            self.enforce_robots(&current).await?;
+            let host = host_key(&current);
+            let _permit = self.gate.enter(&host).await;
 
             let mut resp = self
                 .client

@@ -299,6 +299,8 @@ impl BrowserCore {
         };
         if let Some(c) = cached {
             fetch::validate_cached_url(&c.final_url, opts.allow_local)?;
+            self.fetcher.enforce_robots_for_url(url).await?;
+            self.fetcher.enforce_robots_for_url(&c.final_url).await?;
             return Ok(FetchResult {
                 final_url: c.final_url,
                 status: c.status,
