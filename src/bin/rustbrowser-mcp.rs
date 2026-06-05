@@ -5,14 +5,16 @@
 //! Transport is stdio: the MCP protocol speaks over stdout, so NOTHING may be
 //! printed to stdout except protocol frames. All diagnostics go to stderr.
 
+use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::Result;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars,
+    service::QuitReason,
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use serde::Deserialize;
@@ -330,9 +332,44 @@ impl ServerHandler for RustBrowserServer {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // stdout is reserved for the MCP protocol; never print to it.
-    let service = RustBrowserServer::new().serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+async fn main() -> ExitCode {
+    // stdout carries the MCP protocol frames; every diagnostic goes to stderr so
+    // it can never corrupt the stream.
+    eprintln!("rustbrowser-mcp: starting on stdio transport");
+
+    let service = match RustBrowserServer::new().serve(stdio()).await {
+        Ok(service) => service,
+        Err(e) => {
+            eprintln!("rustbrowser-mcp: failed to start MCP service: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Run until the client disconnects (stdin EOF) or the service is cancelled —
+    // both are clean shutdowns. Only a panicked/aborted service task or a
+    // transport error is a genuine failure worth a non-zero exit.
+    match service.waiting().await {
+        Ok(QuitReason::Closed) => {
+            eprintln!("rustbrowser-mcp: client disconnected, shutting down");
+            ExitCode::SUCCESS
+        }
+        Ok(QuitReason::Cancelled) => {
+            eprintln!("rustbrowser-mcp: service cancelled, shutting down");
+            ExitCode::SUCCESS
+        }
+        Ok(QuitReason::JoinError(e)) => {
+            eprintln!("rustbrowser-mcp: service task failed: {e}");
+            ExitCode::FAILURE
+        }
+        Ok(other) => {
+            // Future rmcp versions may add shutdown reasons; treat an unknown one
+            // as a clean stop, but log it so the cause is visible.
+            eprintln!("rustbrowser-mcp: shutting down ({other:?})");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rustbrowser-mcp: transport error while serving: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -193,6 +193,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v0.4** — headless 自動 fallback(auto 偵測 JS 動態站)+ 連結/表格結構化擷取
 - ✅ **v0.5** — 全頁連結擷取 · headless 等待控制(`--js-wait` / CDP `--js-wait-for`)· release 發布自動化
 - ✅ **v0.6(強化)** — wiremock 端到端整合測試 · `--allow-local` loopback 豁免 · `cache` 維護子命令 · headless sandbox 預設開啟 + DOM 上限
+- ✅ **v0.7(穩健性)** — headless DOM cap 改串流讀取真正限制記憶體 · `cache` 失敗回傳非零 exit code · MCP transport 明確處理斷線/錯誤(乾淨關閉、診斷只進 stderr)
 
 ## 技術棧
 
