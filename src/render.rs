@@ -137,6 +137,45 @@ fn cap_dom(mut html: String) -> String {
     html
 }
 
+/// Read up to `max` bytes from `reader`, stopping the moment the cap is reached
+/// rather than buffering the entire stream first. This is what makes the render
+/// cap a real memory bound: a hostile page that emits gigabytes of DOM costs us
+/// at most ~`max` bytes before we stop reading and tear the browser down.
+#[cfg(feature = "js")]
+async fn read_capped<R>(reader: &mut R, max: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while buf.len() < max {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break; // EOF
+        }
+        let take = n.min(max - buf.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if take < n {
+            break; // hit the cap mid-chunk
+        }
+    }
+    Ok(buf)
+}
+
+#[cfg(feature = "js")]
+fn cdp_byte_capped_outer_html_expr(max: usize) -> String {
+    format!(
+        r#"(() => {{
+const html = document.documentElement.outerHTML;
+const encoder = new TextEncoder();
+const bytes = encoder.encode(html);
+const capped = bytes.length > {max} ? bytes.slice(0, {max}) : bytes;
+return new TextDecoder("utf-8", {{ fatal: false }}).decode(capped);
+}})()"#
+    )
+}
+
 /// Render `url` with a headless browser and return the post-JavaScript DOM.
 ///
 /// `wait` doubles as the virtual-time budget — how long to let JS run.
@@ -151,23 +190,42 @@ pub async fn render_html(url: &str, wait: Duration) -> Result<String> {
     args.push("--dump-dom".into());
     args.push(url.to_string());
 
-    let run = Command::new(&chrome)
+    let mut child = Command::new(&chrome)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output();
-
-    let out = timeout(wait + Duration::from_secs(15), run)
-        .await
-        .context("headless render timed out")?
+        .kill_on_drop(true)
+        .spawn()
         .context("launching headless browser")?;
 
-    if !out.status.success() {
-        bail!("headless browser exited unsuccessfully");
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("capturing headless browser stdout")?;
+
+    // Stream the DOM with a hard cap instead of buffering all of stdout: this is
+    // what actually bounds memory. The whole read is bounded by the timeout.
+    let bytes = timeout(
+        wait + Duration::from_secs(15),
+        read_capped(&mut stdout, MAX_RENDER_BYTES),
+    )
+    .await
+    .context("headless render timed out")?
+    .context("reading headless DOM")?;
+
+    let hit_cap = bytes.len() == MAX_RENDER_BYTES;
+    if hit_cap {
+        // We intentionally stop reading once the cap is reached; kill Chrome so
+        // it cannot keep writing a huge DOM into the pipe.
+        let _ = child.kill().await;
+    } else {
+        let status = child.wait().await.context("waiting for headless browser")?;
+        if !status.success() {
+            bail!("headless browser exited unsuccessfully");
+        }
     }
-    // Cap before decoding so a giant DOM never materialises fully in memory.
-    let capped = &out.stdout[..out.stdout.len().min(MAX_RENDER_BYTES)];
-    let html = String::from_utf8_lossy(capped).into_owned();
+
+    let html = String::from_utf8_lossy(&bytes).into_owned();
     if html.trim().is_empty() {
         bail!("headless render produced an empty DOM");
     }
@@ -256,7 +314,10 @@ async fn cdp_session(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let dom = cdp_eval(&mut ws, id + 1, "document.documentElement.outerHTML").await?;
+    // Cap by UTF-8 bytes in the browser so the CDP payload itself is bounded.
+    // `cap_dom` remains a byte-level backstop after JSON decoding.
+    let expr = cdp_byte_capped_outer_html_expr(MAX_RENDER_BYTES);
+    let dom = cdp_eval(&mut ws, id + 1, &expr).await?;
     dom.as_str()
         .map(str::to_string)
         .map(cap_dom)
@@ -398,6 +459,33 @@ mod tests {
     fn cap_dom_passes_small_input_through() {
         let small = "<html><body>hi</body></html>".to_string();
         assert_eq!(cap_dom(small.clone()), small);
+    }
+
+    #[cfg(feature = "js")]
+    #[tokio::test]
+    async fn read_capped_stops_at_limit() {
+        let data = vec![b'x'; 100_000];
+        let mut src: &[u8] = &data;
+        let out = read_capped(&mut src, 4096).await.unwrap();
+        assert_eq!(out.len(), 4096); // stopped at the cap, did not read all 100 KB
+    }
+
+    #[cfg(feature = "js")]
+    #[tokio::test]
+    async fn read_capped_returns_all_when_under_limit() {
+        let data = vec![b'y'; 1000];
+        let mut src: &[u8] = &data;
+        let out = read_capped(&mut src, 4096).await.unwrap();
+        assert_eq!(out.len(), 1000); // whole stream fits under the cap
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn cdp_capture_expression_caps_utf8_bytes_in_browser() {
+        let expr = cdp_byte_capped_outer_html_expr(4096);
+        assert!(expr.contains("new TextEncoder()"));
+        assert!(expr.contains("bytes.slice(0, 4096)"));
+        assert!(!expr.contains("outerHTML.slice"));
     }
 
     #[cfg(feature = "js")]

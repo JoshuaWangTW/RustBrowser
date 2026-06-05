@@ -4,7 +4,7 @@ mod cli;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::json;
 
@@ -17,15 +17,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Fetch(args) => run_fetch(args).await,
-        Command::Cache(args) => {
-            run_cache(args);
-            Ok(())
-        }
+        Command::Cache(args) => run_cache(args),
     }
 }
 
-/// Inspect or clean the on-disk cache.
-fn run_cache(args: CacheArgs) {
+/// Inspect or clean the on-disk cache. Returns an error — and so a non-zero exit
+/// code — when a prune/clear operation fails, so scripts can detect it.
+fn run_cache(args: CacheArgs) -> Result<()> {
     match args.action {
         CacheAction::Info => {
             let r = cache::report();
@@ -45,23 +43,24 @@ fn run_cache(args: CacheArgs) {
                 human_bytes(r.total_bytes())
             );
         }
-        CacheAction::Prune { older_than } => match cache::prune(older_than) {
-            Ok(p) => println!(
+        CacheAction::Prune { older_than } => {
+            let p = cache::prune(older_than).context("pruning cache")?;
+            println!(
                 "pruned {} entries older than {older_than}s ({} freed)",
                 p.removed,
                 human_bytes(p.bytes)
-            ),
-            Err(e) => eprintln!("prune failed: {e}"),
-        },
-        CacheAction::Clear => match cache::clear() {
-            Ok(p) => println!(
+            );
+        }
+        CacheAction::Clear => {
+            let p = cache::clear().context("clearing cache")?;
+            println!(
                 "cleared {} entries ({} freed)",
                 p.removed,
                 human_bytes(p.bytes)
-            ),
-            Err(e) => eprintln!("clear failed: {e}"),
-        },
+            );
+        }
     }
+    Ok(())
 }
 
 /// Human-readable byte size (binary units).
