@@ -138,7 +138,7 @@ pub struct FetchArgs {
     #[arg(long)]
     pub max_output_tokens: Option<usize>,
 
-    /// Print extraction-quality diagnostics to stderr (included in JSON output).
+    /// Print extraction-quality diagnostics to stderr (or in JSON output).
     #[arg(long)]
     pub diagnostics: bool,
 }

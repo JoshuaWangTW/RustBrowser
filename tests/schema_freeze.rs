@@ -70,3 +70,14 @@ fn cache_subcommands_are_frozen() {
         );
     }
 }
+
+#[test]
+fn cache_prune_flags_are_frozen() {
+    let Some(h) = help(&["cache", "prune", "--help"]) else {
+        return;
+    };
+    assert!(
+        h.contains("--older-than"),
+        "frozen `cache prune` flag --older-than is missing"
+    );
+}

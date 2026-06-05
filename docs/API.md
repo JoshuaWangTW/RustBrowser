@@ -18,7 +18,7 @@ Positional: one or more URLs (multiple are fetched concurrently as a batch).
 | `--selector` | CSS selector | — | Extract matching elements instead of running a profile. |
 | `--profile` | `article` \| `full` \| `metadata` | `article` | Content selection (ignored when `--selector` is set). |
 | `--stats` | flag | off | Print token-savings stats to stderr. |
-| `--diagnostics` | flag | off | Print extraction-quality diagnostics to stderr (always present in JSON). |
+| `--diagnostics` | flag | off | Print extraction-quality diagnostics to stderr; with `--format json`, include diagnostics in the JSON result. |
 | `--max-output-tokens` | integer | — | Truncate Markdown/text output to this many tokens. |
 | `--timeout` | seconds | `20` | Request timeout. |
 | `--max-bytes` | bytes | `8388608` | Cap on decoded response body. |
