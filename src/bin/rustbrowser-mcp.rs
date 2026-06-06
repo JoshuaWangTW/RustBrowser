@@ -108,6 +108,13 @@ struct FetchParams {
     /// Attach extraction-quality diagnostics to the result (default false).
     #[serde(default)]
     diagnostics: Option<bool>,
+    /// Extract the operable action tree (links/forms/buttons/downloads).
+    #[serde(default)]
+    extract_actions: Option<bool>,
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
+    #[serde(default)]
+    max_actions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -179,6 +186,13 @@ struct FetchManyParams {
     /// Attach extraction-quality diagnostics to each result (default false).
     #[serde(default)]
     diagnostics: Option<bool>,
+    /// Extract the operable action tree (links/forms/buttons/downloads).
+    #[serde(default)]
+    extract_actions: Option<bool>,
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
+    #[serde(default)]
+    max_actions: Option<usize>,
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -220,6 +234,8 @@ fn opts_from(
     profile: Option<&str>,
     max_output_tokens: Option<usize>,
     diagnostics: Option<bool>,
+    extract_actions: Option<bool>,
+    max_actions: Option<usize>,
 ) -> DistillOptions {
     let links_full = links_full.unwrap_or(false);
     DistillOptions {
@@ -244,6 +260,8 @@ fn opts_from(
         profile: parse_profile(profile),
         max_output_tokens,
         diagnostics: diagnostics.unwrap_or(false),
+        extract_actions: extract_actions.unwrap_or(false),
+        max_actions,
     }
 }
 
@@ -297,6 +315,32 @@ fn render(result: &Distilled, fmt: &str) -> Result<String, rmcp::ErrorData> {
         }
     }
 
+    if let Some(a) = &result.actions {
+        out.push_str(&format!("\n\n## Actions ({})\n", a.len()));
+        for l in &a.links {
+            out.push_str(&format!("\n- [{}] {} → {}", l.action_id, l.text, l.href));
+        }
+        for f in &a.forms {
+            out.push_str(&format!(
+                "\n- [{}] form {} {} ({} fields, submit={})",
+                f.action_id,
+                f.method,
+                f.action,
+                f.fields.len(),
+                f.submit_id
+            ));
+        }
+        for b in &a.buttons {
+            out.push_str(&format!("\n- [{}] button: {}", b.action_id, b.text));
+        }
+        for d in &a.downloads {
+            out.push_str(&format!(
+                "\n- [{}] download: {} → {}",
+                d.action_id, d.text, d.href
+            ));
+        }
+    }
+
     if let Some(st) = &result.stats {
         out.push_str(&format!(
             "\n\n---\n_token stats: raw {} → output {} ({:.1}% saved)_",
@@ -339,12 +383,54 @@ impl RustBrowserServer {
             p.profile.as_deref(),
             p.max_output_tokens,
             p.diagnostics,
+            p.extract_actions,
+            p.max_actions,
         );
         let result = distill(&p.url, &opts)
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(format!("fetch failed: {e}"), None))?;
         let fmt = p.format.as_deref().unwrap_or("markdown");
         render(&result, fmt)
+    }
+
+    #[tool(
+        description = "OBSERVE a web page for Browser Use: returns its distilled content AND an action tree — the links, forms (with their fields and a submit id), standalone buttons, and downloads on the page, each tagged with a stable action_id (e.g. link_3, form_0.submit). Use this when you need to know what is OPERABLE on a page (to follow a link or submit a form next), not just read it. Always returns JSON; action categories, form fields, select options, and long scalar fields are capped to stay token-lean."
+    )]
+    async fn observe_url(
+        &self,
+        Parameters(p): Parameters<FetchParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let mut opts = opts_from(
+            p.timeout_secs,
+            p.max_bytes,
+            p.selector,
+            p.stats,
+            p.no_cache,
+            p.cache_ttl,
+            p.extract_links,
+            p.extract_tables,
+            p.links_full,
+            p.js.as_deref(),
+            p.js_wait,
+            p.js_wait_for,
+            p.allow_local,
+            p.max_retries,
+            p.per_host_concurrency,
+            p.rate_limit,
+            p.respect_robots,
+            p.profile.as_deref(),
+            p.max_output_tokens,
+            p.diagnostics,
+            p.extract_actions,
+            p.max_actions,
+        );
+        // Observe always surfaces the action tree (and diagnostics), as JSON.
+        opts.extract_actions = true;
+        opts.diagnostics = true;
+        let result = distill(&p.url, &opts)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None))?;
+        render(&result, "json")
     }
 
     #[tool(
@@ -375,6 +461,8 @@ impl RustBrowserServer {
             p.profile.as_deref(),
             p.max_output_tokens,
             p.diagnostics,
+            p.extract_actions,
+            p.max_actions,
         );
         let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
         let fmt = p.format.as_deref().unwrap_or("markdown");
@@ -412,10 +500,11 @@ impl RustBrowserServer {
 impl ServerHandler for RustBrowserServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "RustBrowser: token-lean web fetching. fetch_url distills one page; fetch_urls \
-             fetches many concurrently. Both return clean Markdown instead of raw HTML, saving \
-             75-98% of tokens, with an on-disk cache and automatic headless rendering for \
-             JS-heavy pages.",
+            "RustBrowser: token-lean web fetching and Browser Use. fetch_url distills one page; \
+             fetch_urls fetches many concurrently; observe_url returns a page's distilled content \
+             plus an action tree (links/forms/buttons/downloads with stable action_ids) for \
+             deciding what to do next. All return clean output instead of raw HTML, saving 75-98% \
+             of tokens, with an on-disk cache and automatic headless rendering for JS-heavy pages.",
         )
     }
 }
@@ -539,6 +628,8 @@ mod tests {
             "per_host_concurrency",
             "rate_limit",
             "respect_robots",
+            "extract_actions",
+            "max_actions",
         ] {
             assert!(
                 props.contains(key),
@@ -573,6 +664,8 @@ mod tests {
             "per_host_concurrency",
             "rate_limit",
             "respect_robots",
+            "extract_actions",
+            "max_actions",
         ] {
             assert!(
                 props.contains(key),

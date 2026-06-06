@@ -5,6 +5,21 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.1.0]
+
+First step toward **RB-first Browser Use**: RB can now tell an agent what is
+*operable* on a page, not just what it says.
+
+### Added
+- **Action tree** (`--actions` / MCP `extract_actions`) — extracts links, forms
+  (with their fields and a `submit_id`), standalone buttons, and downloads, each
+  with a stable `action_id` (e.g. `link_3`, `form_0.submit`). Per-category caps
+  (`--max-actions`) keep it token-lean.
+- **MCP `observe_url` tool** — returns a page's distilled content plus its action
+  tree as JSON, for "what can I do next?" decisions. `fetch_url` / `fetch_urls`
+  stay backward compatible (opt in via `extract_actions`).
+- `Diagnostics.action_count`; an `actions` fixture + eval coverage.
+
 ## [1.0.0]
 
 First stable release. The public surface is now **frozen under semver**: CLI

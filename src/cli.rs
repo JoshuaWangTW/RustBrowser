@@ -141,6 +141,16 @@ pub struct FetchArgs {
     /// Print extraction-quality diagnostics to stderr (or in JSON output).
     #[arg(long)]
     pub diagnostics: bool,
+
+    /// Extract the operable action tree (links/forms/buttons/downloads) with
+    /// stable action ids. Best viewed with `--format json`.
+    #[arg(long)]
+    pub actions: bool,
+
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
+    #[arg(long)]
+    pub max_actions: Option<usize>,
 }
 
 /// Content-selection profile.

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Document Library — Search & Downloads</title>
+</head>
+<body>
+  <nav aria-label="Main">
+    <a href="/">Home</a>
+    <a href="/library">Library</a>
+    <a href="/account">My account</a>
+  </nav>
+
+  <form method="get" action="/search">
+    <input type="search" name="q" placeholder="Search documents" required>
+    <select name="category">
+      <option value="all">All</option>
+      <option value="reports">Reports</option>
+      <option value="guides">Guides</option>
+    </select>
+    <button type="submit">Search</button>
+  </form>
+
+  <main>
+    <h1>Document Library</h1>
+    <p>Browse and download the latest reports and guides below.</p>
+
+    <ul>
+      <li><a href="/doc/q1-report.pdf">Q1 financial report</a></li>
+      <li><a href="/export/library.csv" download="library.csv">Export catalogue (CSV)</a></li>
+      <li><a href="/doc/style-guide">Style guide (web)</a></li>
+    </ul>
+
+    <button type="button" onclick="loadMore()">Load more results</button>
+
+    <nav aria-label="Pagination">
+      <a href="/library?page=1">Previous</a>
+      <a href="/library?page=3">Next</a>
+    </nav>
+  </main>
+
+  <form method="post" action="/login">
+    <input type="email" name="email" required>
+    <input type="password" name="password" required>
+    <input type="hidden" name="csrf_token" value="tok_9f8e">
+    <input type="checkbox" name="remember" value="1">
+    <button type="submit">Sign in</button>
+  </form>
+
+  <footer><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></footer>
+</body>
+</html>
