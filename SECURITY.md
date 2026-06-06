@@ -123,6 +123,11 @@ forms. The relevant safeguards:
   without an explicit go-ahead.
 - **POST is single-attempt** — a POST is never silently retried, so a
   non-idempotent action cannot be double-submitted by the retry logic.
+- **Action-Loop auto-retry is idempotent-only** — the v1.3 verify step retries a
+  failed step (429/5xx or a transient transport error) only for `observe`,
+  `follow`, and GET submits, up to `max_action_retries` (default 1, capped at 2).
+  A non-GET submit is **never** auto-retried or auto-executed by the loop, and a
+  discarded retry attempt never advances session state.
 - **POST body redirects stay same-origin** — 307/308 redirects preserve method
   and body under HTTP semantics, so RB blocks cross-origin 307/308 POST
   redirects instead of forwarding submitted fields to a new origin.

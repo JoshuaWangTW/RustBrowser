@@ -430,14 +430,18 @@ impl HostGate {
 
 /// Statuses worth retrying: rate-limit and the transient server-side 5xx set.
 /// 500 is included because many gateways surface transient faults as a bare 500.
-fn is_retryable_status(status: u16) -> bool {
+/// `pub(crate)` so the session's Action-Loop verify step can reuse the exact same
+/// notion of "retryable" rather than re-deriving it.
+pub(crate) fn is_retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 /// Whether an error is worth retrying: connect/timeout transport errors, but
 /// never our own SSRF block (surfaced as a `PermissionDenied` io error) and
 /// never the non-network bails (scheme, redirect cap, …).
-fn is_transient_error(e: &anyhow::Error) -> bool {
+/// `pub(crate)` so the session's Action-Loop can give an idempotent step one more
+/// try on a transient transport failure without duplicating this logic.
+pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>()
             && io.kind() == std::io::ErrorKind::PermissionDenied

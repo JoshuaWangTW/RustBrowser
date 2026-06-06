@@ -114,14 +114,22 @@ impl RustBrowserServer {
     }
 }
 
-/// Serialise a session's public state (id, current URL, history, snapshot) as
-/// JSON for return to the agent.
+/// How many recent operation-log entries to include in a session view.
+const SESSION_LOG_TAIL: usize = 25;
+
+/// Serialise a session's public state as JSON for return to the agent.
+///
+/// The original 1.x fields (`session_id`, `current_url`, `redirect_history`,
+/// `snapshot`) are kept for compatibility; the Action-Loop view (`loop`) and the
+/// debug `operation_log` are **added** on top (see docs/API.md).
 fn session_view(id: &str, session: &Session) -> Result<String, rmcp::ErrorData> {
     let view = json!({
         "session_id": id,
         "current_url": session.current_url(),
         "redirect_history": session.redirect_history(),
         "snapshot": session.snapshot(),
+        "loop": session.loop_view(),
+        "operation_log": session.recent_log(SESSION_LOG_TAIL),
     });
     serde_json::to_string_pretty(&view)
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
@@ -303,6 +311,11 @@ struct SessionStartParams {
     /// Respect each host's robots.txt (default false).
     #[serde(default)]
     respect_robots: Option<bool>,
+    /// Extra attempts for an idempotent step (observe/follow/GET submit) when it
+    /// fails verification — a 429/5xx or transient transport error. Clamped to
+    /// 0–2 (default 1). Non-GET submits are NEVER auto-retried.
+    #[serde(default)]
+    max_action_retries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -669,6 +682,9 @@ impl RustBrowserServer {
         self.ensure_session_capacity()?;
         let mut session = Session::new(session_opts(&p))
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        if let Some(n) = p.max_action_retries {
+            session = session.with_max_action_retries(n);
+        }
         session.observe(&p.url).await.map_err(|e| {
             rmcp::ErrorData::internal_error(format!("session start failed: {e}"), None)
         })?;
@@ -769,9 +785,13 @@ impl ServerHandler for RustBrowserServer {
              plus an action tree (links/forms/buttons/downloads with stable action_ids). For \
              multi-step flows use a SESSION: session_start opens a page and keeps cookies + \
              history, then session_observe / session_follow / session_submit_form drive it by \
-             action_id (GET forms submit immediately; non-GET needs confirm=true). Use \
-             session_close to forget cookies and release the session. All return clean output \
-             instead of raw HTML, saving 75-98% of tokens.",
+             action_id (GET forms submit immediately; non-GET needs confirm=true). Every session \
+             reply includes a planner-friendly `loop` view (state, available_actions, \
+             recommended_next_actions, failure_reason) and a debug `operation_log`; idempotent \
+             steps are verified and retried up to max_action_retries on a transient failure, while \
+             dangerous (non-GET) submits are never auto-executed or retried. Use session_close to \
+             forget cookies and release the session. All return clean output instead of raw HTML, \
+             saving 75-98% of tokens.",
         )
     }
 }
@@ -951,6 +971,7 @@ mod tests {
             "timeout_secs",
             "allow_local",
             "respect_robots",
+            "max_action_retries",
         ] {
             assert!(
                 start.contains(key),

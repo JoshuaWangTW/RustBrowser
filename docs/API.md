@@ -103,17 +103,31 @@ Same parameters as `fetch_url` **except** `url`/`selector`, plus:
 
 A session keeps a cookie jar, the current URL, a redirect history, and the last
 snapshot (with its action tree). Navigation and successful submit tools return
-the session view as JSON
-(`{session_id, current_url, redirect_history, snapshot}`). `session_close`
-forgets the session and returns `{session_id, closed}`.
+the session view as JSON. The view's 1.x fields
+(`{session_id, current_url, redirect_history, snapshot}`) are stable; since 1.3
+it **also** carries an Action-Loop `loop` object and a debug `operation_log`
+(both additive):
+
+- `loop.state` — `{url?, status, title, excerpt?, content_chars, action_count, low_content, used_headless, steps_taken}`.
+- `loop.available_actions` — array of `{action_id, kind, label, target?, method?, dangerous?, fields?}` (links/forms/buttons/downloads flattened).
+- `loop.recommended_next_actions` — array of `{action_id, kind, why}` (heuristic hints, never auto-executed).
+- `loop.failure_reason` — string, present only when the last step failed verification (an HTTP error status).
+- `operation_log` — recent array of `{step, op, target, status?, attempt, outcome, failure_reason?}`.
+
+`session_close` forgets the session and returns `{session_id, closed}`.
 
 | Tool | Params | Notes |
 |---|---|---|
-| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots` | Opens `url`, returns a `session_id` + first snapshot. |
+| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries` | Opens `url`, returns a `session_id` + first snapshot + `loop`. |
 | `session_observe` | `session_id`, `url` | Navigate the session to `url` (keeps cookies). |
 | `session_follow` | `session_id`, `action_id` | Follow a `link_*`/`download_*` from the last snapshot. |
 | `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns `{needs_confirmation, would_submit}`). |
 | `session_close` | `session_id` | Close a session and forget its cookies, URL, history, and snapshot. |
+
+`max_action_retries` (default `1`, clamped to `0`–`2`) gives an idempotent step
+(observe / follow / GET submit) extra attempts when it fails verification
+(429/5xx or a transient transport error). A non-GET submit is **never**
+auto-retried.
 
 ## JSON output schema (`Distilled`)
 
