@@ -109,6 +109,23 @@ sets `RUSTBROWSER_NO_SANDBOX=1` (for containers or root where the sandbox
 cannot initialise). Headless rendering is also off the hot path: the lean HTTP
 fetch is the default and the browser is only launched when needed.
 
+### Sessions & form submission
+
+Stateful sessions (`session_*`) keep a per-session cookie jar and submit HTML
+forms. The relevant safeguards:
+
+- **Same SSRF boundary** — `follow`/`submit` resolve URLs from the page's action
+  tree (already restricted to `http`/`https`) and send them through the exact
+  same screened path as a plain fetch; redirects are re-validated per hop.
+- **Confirmation for dangerous actions** — a non-GET submit (POST/PUT/DELETE/…)
+  is **never sent automatically**. It is described back to the caller and only
+  executed when `confirm=true` is passed. RB never POSTs on an agent's behalf
+  without an explicit go-ahead.
+- **POST is single-attempt** — a POST is never silently retried, so a
+  non-idempotent action cannot be double-submitted by the retry logic.
+- **Cookies are in-memory and per-session** — they live only for the life of the
+  session object and are not written to disk.
+
 ## Hardening checklist for operators
 
 - Run with the default profile of limits; only raise `--max-bytes` /

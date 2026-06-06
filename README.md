@@ -276,6 +276,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v0.9(擷取品質)** — 擷取 profile(article/full/metadata)· token 預算截斷 · 品質診斷 · `distill_html` 離線管線 + 固定評測集
 - ✅ **v1.0(穩定版)** — CLI/MCP schema 凍結(+ 守門測試)· 完整安全文件(`SECURITY.md`)· semver 承諾 + `CHANGELOG.md` · CI 覆蓋 Linux/Windows/macOS · 三平台 release binaries + checksums
 - ✅ **v1.1(Actionable Observe)** — action tree(links/forms/buttons/downloads + 穩定 action_id)· MCP `observe_url` 工具 · action token 上限 · action 抽取評測。Browser Use 的第一步:RB 先能告訴 agent「這頁有哪些可操作的東西」
+- ✅ **v1.2(Session + Static Actions)** — 有狀態 session(cookie jar / current URL / redirect history / last snapshot)· MCP `session_start`/`session_observe`/`session_follow`/`session_submit_form` · HTML 表單提交(GET 帶 query、POST 帶 body,自動帶 hidden/selected 預設值)· 高風險(非 GET)action 需 `confirm=true` 才送。Browser Use 第二步:能 act,不只 observe
 
 ## 技術棧
 

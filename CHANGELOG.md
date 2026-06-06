@@ -5,6 +5,23 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.2.0]
+
+Second Browser-Use step: **stateful sessions** so an agent can act, not just
+observe.
+
+### Added
+- **Sessions** (`Session` in the library; `session_start` / `session_observe` /
+  `session_follow` / `session_submit_form` MCP tools) — keep a cookie jar,
+  current URL, redirect history, and the last snapshot's action tree.
+- **HTML form submission** — GET forms become a query string; POST forms send a
+  urlencoded body. The form's own defaults (hidden CSRF fields, selected
+  options) are merged with the caller's values automatically. POST is single-
+  attempt (never silently retried).
+- **Dangerous-action confirmation** — a non-GET submit is described but **not
+  sent** unless the caller passes `confirm=true`.
+- Every session request reuses the same SSRF-screened path as a plain fetch.
+
 ## [1.1.0]
 
 First step toward **RB-first Browser Use**: RB can now tell an agent what is
