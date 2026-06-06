@@ -13,6 +13,7 @@ pub mod fetch;
 pub mod render;
 #[cfg(feature = "robots")]
 pub mod robots;
+pub mod session;
 pub mod structured;
 pub mod tokens;
 

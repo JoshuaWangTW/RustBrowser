@@ -5,7 +5,10 @@
 //! Transport is stdio: the MCP protocol speaks over stdout, so NOTHING may be
 //! printed to stdout except protocol frames. All diagnostics go to stderr.
 
+use std::collections::HashMap;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rmcp::{
@@ -19,23 +22,109 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 
+use rustbrowser::session::{Session, SubmitOutcome};
 use rustbrowser::{DistillOptions, Distilled, JsMode, Profile, distill, distill_many};
 
-#[derive(Debug, Clone)]
+/// One live browsing session, guarded so a single session's actions serialise.
+type SharedSession = Arc<AsyncMutex<Session>>;
+
+const MAX_LIVE_SESSIONS: usize = 64;
+
+#[derive(Clone)]
 struct RustBrowserServer {
     // Read by the `#[tool_handler]` macro's generated ServerHandler impl,
     // which the dead-code lint can't see through.
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    /// Live browsing sessions, keyed by id. The map lock is held only briefly to
+    /// look up / insert; per-session work locks the inner `AsyncMutex`.
+    sessions: Arc<Mutex<HashMap<String, SharedSession>>>,
 }
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl RustBrowserServer {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    fn next_session_id() -> String {
+        format!("sess_{}", SESSION_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn lookup_session(&self, id: &str) -> Result<SharedSession, rmcp::ErrorData> {
+        self.sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .get(id)
+            .cloned()
+            .ok_or_else(|| rmcp::ErrorData::invalid_params(format!("unknown session '{id}'"), None))
+    }
+
+    fn ensure_session_capacity(&self) -> Result<(), rmcp::ErrorData> {
+        let len = self
+            .sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .len();
+        if len >= MAX_LIVE_SESSIONS {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "too many live sessions; close one with session_close first (limit {MAX_LIVE_SESSIONS})"
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_session(&self, id: String, session: Session) -> Result<(), rmcp::ErrorData> {
+        let mut sessions = self.sessions.lock().expect("session map mutex poisoned");
+        if sessions.len() >= MAX_LIVE_SESSIONS {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "too many live sessions; close one with session_close first (limit {MAX_LIVE_SESSIONS})"
+                ),
+                None,
+            ));
+        }
+        sessions.insert(id, Arc::new(AsyncMutex::new(session)));
+        Ok(())
+    }
+
+    fn close_session(&self, id: &str) -> Result<(), rmcp::ErrorData> {
+        let removed = self
+            .sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .remove(id);
+        if removed.is_some() {
+            Ok(())
+        } else {
+            Err(rmcp::ErrorData::invalid_params(
+                format!("unknown session '{id}'"),
+                None,
+            ))
+        }
+    }
+}
+
+/// Serialise a session's public state (id, current URL, history, snapshot) as
+/// JSON for return to the agent.
+fn session_view(id: &str, session: &Session) -> Result<String, rmcp::ErrorData> {
+    let view = json!({
+        "session_id": id,
+        "current_url": session.current_url(),
+        "redirect_history": session.redirect_history(),
+        "snapshot": session.snapshot(),
+    });
+    serde_json::to_string_pretty(&view)
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -193,6 +282,81 @@ struct FetchManyParams {
     /// entries (avoids action-tree blowup).
     #[serde(default)]
     max_actions: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionStartParams {
+    /// The URL to open as the session's first page.
+    url: String,
+    /// Content profile: "article" (default), "full" (whole body), or "metadata".
+    #[serde(default)]
+    profile: Option<String>,
+    /// Cap each action category, form fields, and select options at this many.
+    #[serde(default)]
+    max_actions: Option<usize>,
+    /// Request timeout in seconds (default 20).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Permit loopback/localhost targets (only loopback freed).
+    #[serde(default)]
+    allow_local: Option<bool>,
+    /// Respect each host's robots.txt (default false).
+    #[serde(default)]
+    respect_robots: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionObserveParams {
+    /// The session id from session_start.
+    session_id: String,
+    /// The URL to navigate to in this session.
+    url: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionFollowParams {
+    /// The session id from session_start.
+    session_id: String,
+    /// A `link_*` or `download_*` action id from the last snapshot.
+    action_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionCloseParams {
+    /// The session id to close and forget.
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionSubmitFormParams {
+    /// The session id from session_start.
+    session_id: String,
+    /// A `form_*` action id from the last snapshot.
+    form_id: String,
+    /// Field name → value to submit (merged over the form's own defaults such as
+    /// hidden CSRF fields and selected options).
+    #[serde(default)]
+    values: HashMap<String, String>,
+    /// Required to actually send a non-GET (dangerous) submit. Without it, a
+    /// POST/etc. is described but NOT sent.
+    #[serde(default)]
+    confirm: Option<bool>,
+}
+
+/// Build the per-session distill options. Sessions always observe the action
+/// tree and run live (no cache).
+fn session_opts(p: &SessionStartParams) -> DistillOptions {
+    DistillOptions {
+        timeout: Duration::from_secs(p.timeout_secs.unwrap_or(20)),
+        profile: parse_profile(p.profile.as_deref()),
+        max_actions: p.max_actions,
+        allow_local: p.allow_local.unwrap_or(false),
+        respect_robots: p.respect_robots.unwrap_or(false),
+        extract_actions: true,
+        diagnostics: true,
+        use_cache: false,
+        ..Default::default()
+    }
 }
 
 fn parse_js_mode(js: Option<&str>) -> JsMode {
@@ -494,6 +658,106 @@ impl RustBrowserServer {
         }
         Ok(out)
     }
+
+    #[tool(
+        description = "START a stateful browsing SESSION (Browser Use). Opens a URL and keeps a cookie jar, the current URL, a redirect history, and the page snapshot with its action tree. Returns a session_id plus that snapshot. Drive the session afterwards with session_observe / session_follow / session_submit_form using the action_ids in the snapshot. Cookies persist, so login and search flows work without a real browser."
+    )]
+    async fn session_start(
+        &self,
+        Parameters(p): Parameters<SessionStartParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        self.ensure_session_capacity()?;
+        let mut session = Session::new(session_opts(&p))
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        session.observe(&p.url).await.map_err(|e| {
+            rmcp::ErrorData::internal_error(format!("session start failed: {e}"), None)
+        })?;
+        let id = Self::next_session_id();
+        let view = session_view(&id, &session)?;
+        self.insert_session(id, session)?;
+        Ok(view)
+    }
+
+    #[tool(
+        description = "Navigate an existing SESSION to a new URL (keeps its cookies). Returns the updated snapshot + action tree."
+    )]
+    async fn session_observe(
+        &self,
+        Parameters(p): Parameters<SessionObserveParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let shared = self.lookup_session(&p.session_id)?;
+        let mut session = shared.lock().await;
+        session
+            .observe(&p.url)
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None))?;
+        session_view(&p.session_id, &session)
+    }
+
+    #[tool(
+        description = "FOLLOW a link (or download) in a SESSION by its action_id (e.g. link_3) from the last snapshot. Returns the updated snapshot + action tree."
+    )]
+    async fn session_follow(
+        &self,
+        Parameters(p): Parameters<SessionFollowParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let shared = self.lookup_session(&p.session_id)?;
+        let mut session = shared.lock().await;
+        session
+            .follow(&p.action_id)
+            .await
+            .map_err(|e| rmcp::ErrorData::invalid_params(format!("follow failed: {e}"), None))?;
+        session_view(&p.session_id, &session)
+    }
+
+    #[tool(
+        description = "Close a SESSION and forget its cookies, current URL, history, and snapshot."
+    )]
+    async fn session_close(
+        &self,
+        Parameters(p): Parameters<SessionCloseParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        self.close_session(&p.session_id)?;
+        let view = json!({
+            "session_id": p.session_id,
+            "closed": true,
+        });
+        serde_json::to_string_pretty(&view)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+    }
+
+    #[tool(
+        description = "SUBMIT a form in a SESSION by its form_id (e.g. form_0), merging your field values over the form's own defaults (hidden CSRF fields, selected options). GET forms (search/filter) submit immediately. A non-GET (POST/etc.) form is DANGEROUS: it is only described, not sent, unless you pass confirm=true — RB never silently submits on your behalf."
+    )]
+    async fn session_submit_form(
+        &self,
+        Parameters(p): Parameters<SessionSubmitFormParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let shared = self.lookup_session(&p.session_id)?;
+        let mut session = shared.lock().await;
+        let values: Vec<(String, String)> = p.values.into_iter().collect();
+        let outcome = session
+            .submit_form(&p.form_id, &values, p.confirm.unwrap_or(false))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("submit failed: {e}"), None))?;
+        match outcome {
+            SubmitOutcome::Submitted => session_view(&p.session_id, &session),
+            SubmitOutcome::NeedsConfirmation {
+                method,
+                action,
+                fields,
+            } => {
+                let view = json!({
+                    "session_id": p.session_id,
+                    "needs_confirmation": true,
+                    "message": "Dangerous (non-GET) submit withheld. Re-call session_submit_form with confirm=true to send it.",
+                    "would_submit": { "method": method, "action": action, "fields": fields },
+                });
+                serde_json::to_string_pretty(&view)
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+            }
+        }
+    }
 }
 
 #[tool_handler]
@@ -502,9 +766,12 @@ impl ServerHandler for RustBrowserServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "RustBrowser: token-lean web fetching and Browser Use. fetch_url distills one page; \
              fetch_urls fetches many concurrently; observe_url returns a page's distilled content \
-             plus an action tree (links/forms/buttons/downloads with stable action_ids) for \
-             deciding what to do next. All return clean output instead of raw HTML, saving 75-98% \
-             of tokens, with an on-disk cache and automatic headless rendering for JS-heavy pages.",
+             plus an action tree (links/forms/buttons/downloads with stable action_ids). For \
+             multi-step flows use a SESSION: session_start opens a page and keeps cookies + \
+             history, then session_observe / session_follow / session_submit_form drive it by \
+             action_id (GET forms submit immediately; non-GET needs confirm=true). Use \
+             session_close to forget cookies and release the session. All return clean output \
+             instead of raw HTML, saving 75-98% of tokens.",
         )
     }
 }
@@ -670,6 +937,50 @@ mod tests {
             assert!(
                 props.contains(key),
                 "frozen FetchManyParams field {key} missing"
+            );
+        }
+    }
+
+    #[test]
+    fn session_tool_params_are_frozen() {
+        let start = schema_props(schemars::schema_for!(SessionStartParams));
+        for key in [
+            "url",
+            "profile",
+            "max_actions",
+            "timeout_secs",
+            "allow_local",
+            "respect_robots",
+        ] {
+            assert!(
+                start.contains(key),
+                "frozen SessionStartParams field {key} missing"
+            );
+        }
+        let observe = schema_props(schemars::schema_for!(SessionObserveParams));
+        for key in ["session_id", "url"] {
+            assert!(
+                observe.contains(key),
+                "frozen SessionObserveParams field {key} missing"
+            );
+        }
+        let follow = schema_props(schemars::schema_for!(SessionFollowParams));
+        for key in ["session_id", "action_id"] {
+            assert!(
+                follow.contains(key),
+                "frozen SessionFollowParams field {key} missing"
+            );
+        }
+        let close = schema_props(schemars::schema_for!(SessionCloseParams));
+        assert!(
+            close.contains("session_id"),
+            "frozen SessionCloseParams field session_id missing"
+        );
+        let submit = schema_props(schemars::schema_for!(SessionSubmitFormParams));
+        for key in ["session_id", "form_id", "values", "confirm"] {
+            assert!(
+                submit.contains(key),
+                "frozen SessionSubmitFormParams field {key} missing"
             );
         }
     }

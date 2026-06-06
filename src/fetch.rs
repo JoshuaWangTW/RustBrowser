@@ -52,6 +52,9 @@ pub struct FetchOptions {
     /// Consult each host's robots.txt and refuse paths it disallows for our
     /// User-Agent (off by default; requires the `robots` feature to enforce).
     pub respect_robots: bool,
+    /// Keep an in-memory cookie jar on the client so `Set-Cookie` persists across
+    /// requests. Off for stateless fetches; on for sessions.
+    pub cookie_store: bool,
 }
 
 impl Default for FetchOptions {
@@ -66,8 +69,18 @@ impl Default for FetchOptions {
             per_host_concurrency: 4,
             min_request_interval: Duration::ZERO,
             respect_robots: false,
+            cookie_store: false,
         }
     }
+}
+
+/// How a form is submitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitMethod {
+    /// Form data becomes the URL query string (idempotent).
+    Get,
+    /// Form data becomes a urlencoded request body (non-idempotent).
+    Post,
 }
 
 /// Outcome of a successful fetch.
@@ -111,6 +124,8 @@ impl Fetcher {
             .brotli(true)
             .deflate(true)
             .redirect(reqwest::redirect::Policy::none())
+            // Persist cookies across a session's requests when asked.
+            .cookie_store(opts.cookie_store)
             // Resolve + screen IPs at the connection layer so reqwest dials the
             // exact addresses we validated — no separate pre-flight lookup that a
             // rebinding/low-TTL DNS could diverge from. Set once on the shared
@@ -144,6 +159,30 @@ impl Fetcher {
         self.fetch_with_retries(url, start).await
     }
 
+    /// Submit a form. `Get` appends the fields as the query string and reuses the
+    /// full retried GET path; `Post` sends a urlencoded body in a **single
+    /// attempt** — POST is non-idempotent and must never be silently re-sent.
+    /// Both go through the same SSRF screening and redirect re-validation.
+    pub async fn submit(
+        &self,
+        action_url: &str,
+        method: SubmitMethod,
+        fields: &[(String, String)],
+    ) -> Result<FetchResult> {
+        match method {
+            SubmitMethod::Get => {
+                let url = build_query_url(action_url, fields)?;
+                self.fetch(&url).await
+            }
+            SubmitMethod::Post => {
+                let start = parse_and_validate_url_basics(action_url, self.opts.allow_local)?;
+                self.fetch_once(action_url, start, Some(fields))
+                    .await
+                    .map(|a| a.res)
+            }
+        }
+    }
+
     /// Enforce robots.txt for a URL string under this fetcher's policy. This is
     /// also used before serving cache hits so `respect_robots` cannot be bypassed
     /// by content fetched under a looser previous policy.
@@ -168,7 +207,7 @@ impl Fetcher {
         let max = self.opts.max_retries;
         let mut attempt = 0usize;
         loop {
-            match self.fetch_once(url, start.clone()).await {
+            match self.fetch_once(url, start.clone(), None).await {
                 Ok(a) if attempt < max && is_retryable_status(a.res.status) => {
                     let delay = a.retry_after.unwrap_or_else(|| backoff_delay(attempt));
                     attempt += 1;
@@ -186,9 +225,22 @@ impl Fetcher {
 
     /// A single fetch attempt: follows redirects (each safety-checked) and reads
     /// the final body. Status is surfaced as-is (no error on 4xx/5xx).
-    async fn fetch_once(&self, url: &str, start: Url) -> Result<Attempt> {
+    async fn fetch_once(
+        &self,
+        url: &str,
+        start: Url,
+        body: Option<&[(String, String)]>,
+    ) -> Result<Attempt> {
         let allow_local = self.opts.allow_local;
         let mut current = start;
+        // A form submit sends POST + body on the first hop; redirects downgrade
+        // to GET (dropping the body) except 307/308, which preserve the method.
+        let mut method = if body.is_some() {
+            reqwest::Method::POST
+        } else {
+            reqwest::Method::GET
+        };
+        let mut form_body: Option<Vec<(String, String)>> = body.map(<[_]>::to_vec);
 
         for redirect_count in 0..=self.opts.max_redirects {
             // First line: cheap, DNS-free checks (scheme, literal IPs, localhost).
@@ -202,9 +254,13 @@ impl Fetcher {
             let host = host_key(&current);
             let _permit = self.gate.enter(&host).await;
 
-            let mut resp = self
-                .client
-                .get(current.clone())
+            let mut builder = self.client.request(method.clone(), current.clone());
+            if method == reqwest::Method::POST
+                && let Some(fields) = &form_body
+            {
+                builder = builder.form(fields);
+            }
+            let mut resp = builder
                 .send()
                 .await
                 .with_context(|| format!("requesting {current}"))?;
@@ -215,7 +271,23 @@ impl Fetcher {
                     bail!("too many redirects while requesting {url}");
                 }
                 if let Some(next) = redirect_target(&current, &resp, allow_local)? {
+                    if method == reqwest::Method::POST
+                        && form_body.is_some()
+                        && matches!(status.as_u16(), 307 | 308)
+                        && !same_origin(&current, &next)
+                    {
+                        bail!(
+                            "cross-origin POST redirect blocked: {} -> {}",
+                            origin_label(&current),
+                            origin_label(&next)
+                        );
+                    }
                     current = next;
+                    // 307/308 preserve method + body; all others become GET.
+                    if !matches!(status.as_u16(), 307 | 308) {
+                        method = reqwest::Method::GET;
+                        form_body = None;
+                    }
                     continue;
                 }
             }
@@ -253,6 +325,21 @@ impl Fetcher {
 /// Convenience fetch for callers that do not need client reuse.
 pub async fn fetch(url: &str, opts: &FetchOptions) -> Result<FetchResult> {
     Fetcher::new(opts.clone())?.fetch(url).await
+}
+
+/// Build `action_url` with `fields` as its query string. HTML GET-form semantics:
+/// the submitted data replaces any query already on the action URL.
+fn build_query_url(action_url: &str, fields: &[(String, String)]) -> Result<String> {
+    let mut url =
+        Url::parse(action_url).with_context(|| format!("invalid form action: {action_url}"))?;
+    url.set_query(None);
+    {
+        let mut pairs = url.query_pairs_mut();
+        for (k, v) in fields {
+            pairs.append_pair(k, v);
+        }
+    }
+    Ok(url.to_string())
 }
 
 /// The gate key for a URL: its host (domain or IP literal). Politeness limits
@@ -570,6 +657,20 @@ fn redirect_target(
         .with_context(|| format!("invalid redirect Location: {location}"))?;
     parse_and_validate_url_basics(next.as_str(), allow_local)?;
     Ok(Some(next))
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn origin_label(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<unknown>");
+    match url.port_or_known_default() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    }
 }
 
 async fn read_limited_body(resp: &mut reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {

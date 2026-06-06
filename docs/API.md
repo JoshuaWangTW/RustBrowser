@@ -51,7 +51,8 @@ Exit code is non-zero if a `prune`/`clear` operation fails.
 
 ## MCP tools
 
-The `rustbrowser-mcp` stdio server exposes three tools.
+The `rustbrowser-mcp` stdio server exposes stateless fetch tools and stateful
+session tools.
 
 ### `fetch_url`
 
@@ -97,6 +98,22 @@ Same parameters as `fetch_url` **except** `url`/`selector`, plus:
 |---|---|---|
 | `urls` | array of string (required) | — |
 | `concurrency` | integer | `8` |
+
+### Session tools (stateful Browser Use)
+
+A session keeps a cookie jar, the current URL, a redirect history, and the last
+snapshot (with its action tree). Navigation and successful submit tools return
+the session view as JSON
+(`{session_id, current_url, redirect_history, snapshot}`). `session_close`
+forgets the session and returns `{session_id, closed}`.
+
+| Tool | Params | Notes |
+|---|---|---|
+| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots` | Opens `url`, returns a `session_id` + first snapshot. |
+| `session_observe` | `session_id`, `url` | Navigate the session to `url` (keeps cookies). |
+| `session_follow` | `session_id`, `action_id` | Follow a `link_*`/`download_*` from the last snapshot. |
+| `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns `{needs_confirmation, would_submit}`). |
+| `session_close` | `session_id` | Close a session and forget its cookies, URL, history, and snapshot. |
 
 ## JSON output schema (`Distilled`)
 
