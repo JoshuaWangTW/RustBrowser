@@ -147,7 +147,8 @@ pub struct FetchArgs {
     #[arg(long)]
     pub actions: bool,
 
-    /// Cap each action category at this many entries (avoids action-tree blowup).
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
     #[arg(long)]
     pub max_actions: Option<usize>,
 }

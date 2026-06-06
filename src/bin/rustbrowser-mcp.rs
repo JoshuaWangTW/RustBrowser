@@ -111,7 +111,8 @@ struct FetchParams {
     /// Extract the operable action tree (links/forms/buttons/downloads).
     #[serde(default)]
     extract_actions: Option<bool>,
-    /// Cap each action category at this many entries (avoids action-tree blowup).
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
     #[serde(default)]
     max_actions: Option<usize>,
 }
@@ -188,7 +189,8 @@ struct FetchManyParams {
     /// Extract the operable action tree (links/forms/buttons/downloads).
     #[serde(default)]
     extract_actions: Option<bool>,
-    /// Cap each action category at this many entries (avoids action-tree blowup).
+    /// Cap each action category, form fields, and select options at this many
+    /// entries (avoids action-tree blowup).
     #[serde(default)]
     max_actions: Option<usize>,
 }
@@ -392,7 +394,7 @@ impl RustBrowserServer {
     }
 
     #[tool(
-        description = "OBSERVE a web page for Browser Use: returns its distilled content AND an action tree — the links, forms (with their fields and a submit id), standalone buttons, and downloads on the page, each tagged with a stable action_id (e.g. link_3, form_0.submit). Use this when you need to know what is OPERABLE on a page (to follow a link or submit a form next), not just read it. Always returns JSON; action categories are capped to stay token-lean."
+        description = "OBSERVE a web page for Browser Use: returns its distilled content AND an action tree — the links, forms (with their fields and a submit id), standalone buttons, and downloads on the page, each tagged with a stable action_id (e.g. link_3, form_0.submit). Use this when you need to know what is OPERABLE on a page (to follow a link or submit a form next), not just read it. Always returns JSON; action categories, form fields, select options, and long scalar fields are capped to stay token-lean."
     )]
     async fn observe_url(
         &self,

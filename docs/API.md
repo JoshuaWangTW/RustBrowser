@@ -37,7 +37,7 @@ Positional: one or more URLs (multiple are fetched concurrently as a batch).
 | `--rate-limit` | requests/sec | `0` | Per-host rate limit (0 = off). |
 | `--respect-robots` | flag | off | Honour each host's robots.txt. |
 | `--actions` | flag | off | Extract the operable action tree (links/forms/buttons/downloads). |
-| `--max-actions` | integer | — | Cap each action category at this many entries. |
+| `--max-actions` | integer | — | Cap each action category, form fields, and select options at this many entries. |
 
 ### `rustbrowser cache <action>`
 
@@ -114,7 +114,7 @@ are omitted when absent.
 | `stats` | object? | `{raw_bytes, raw_tokens, output_tokens, saved_tokens, saved_ratio}` — present with `stats`. |
 | `links` | array? | `{href, text}` — present with link extraction. |
 | `tables` | array? | `{headers, rows}` — present with table extraction. |
-| `actions` | object? | `{links, forms, buttons, downloads}` — present with action extraction. Each entry has a stable `action_id`; forms carry `method`, `action`, `fields`, and `submit_id`. |
+| `actions` | object? | `{links, forms, buttons, downloads}` — present with action extraction. Each entry has a stable `action_id`; forms carry `method`, `action`, `fields`, and `submit_id`; select options are `{value, label, selected}`. Only `http`/`https` URLs are emitted; `<base href>` is respected. |
 | `diagnostics` | object? | `{profile, raw_bytes, output_chars, output_tokens, extraction_ratio, link_count, table_count, action_count, used_headless, truncated, low_content}` — present with `diagnostics`. |
 
 > The exact Markdown text and token numbers are **not** semver-stable — see the

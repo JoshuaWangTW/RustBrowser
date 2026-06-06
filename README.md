@@ -181,10 +181,10 @@ RB 的走向是 **RB-first Browser Use** —— Observe → Act → Verify → F
 
 - `--actions`(MCP `extract_actions`)抽出 **links / forms / buttons / downloads**,每個給穩定 `action_id`(`link_3`、`form_0.submit`…)。
   - **links** —— 一般導覽連結(可 follow)。
-  - **forms** —— `method`、`action`(絕對 URL)、`fields`(name/type/value/options/required)、`submit_id`。可不開瀏覽器直接組 GET/POST。
+  - **forms** —— `method`、`action`(絕對 URL,尊重 `<base href>`)、`fields`(name/type/value/options/required)、`submit_id`。select options 會保留實際提交的 `value` 與可見 `label`,可不開瀏覽器直接組 GET/POST。
   - **buttons** —— 表單外的獨立按鈕(多半是 JS 驅動,標示出來供後續 fallback 判斷)。
   - **downloads** —— 指向檔案的連結(從一般 links 分流出來),帶 `filename`。
-- `--max-actions <n>` 對每類設上限,避免 action tree 爆量。
+- `--max-actions <n>` 對每類 action、每個 form 的 fields、每個 select 的 options 設上限;超長文字/URL/value 也會被限制,避免 action tree 爆量。
 - MCP 新工具 **`observe_url`** —— 回傳頁面摘要 + action tree(JSON),專給「接下來能做什麼」的決策用;`fetch_url` / `fetch_urls` 維持相容(用 `extract_actions` 開啟)。
 
 ```powershell

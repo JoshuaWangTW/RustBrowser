@@ -204,10 +204,19 @@ fn observe_extracts_links_forms_buttons_downloads() {
     assert_eq!(search.submit_id, "form_0.submit");
     assert!(search.fields.iter().any(|f| f.name == "q"));
     assert!(
-        search
-            .fields
-            .iter()
-            .any(|f| f.kind == "select" && f.options == vec!["All", "Reports", "Guides"]),
+        search.fields.iter().any(|f| {
+            f.kind == "select"
+                && f.options
+                    .iter()
+                    .map(|o| o.value.as_str())
+                    .collect::<Vec<_>>()
+                    == vec!["all", "reports", "guides"]
+                && f.options
+                    .iter()
+                    .map(|o| o.label.as_str())
+                    .collect::<Vec<_>>()
+                    == vec!["All", "Reports", "Guides"]
+        }),
         "select options not captured"
     );
 
