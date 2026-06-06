@@ -9,7 +9,7 @@
 //! A non-GET form submit is a *dangerous* action and is refused unless the
 //! caller explicitly confirms — RB never silently POSTs on an agent's behalf.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::actions::FormAction;
 use crate::fetch::{FetchOptions, FetchResult, Fetcher, SubmitMethod};
@@ -88,7 +88,7 @@ impl Session {
     /// Fetch `url` and make it the current snapshot.
     pub async fn observe(&mut self, url: &str) -> Result<&Distilled> {
         let result = self.fetcher.fetch(url).await?;
-        self.record(result);
+        self.record(result)?;
         self.snapshot_ref()
     }
 
@@ -96,7 +96,7 @@ impl Session {
     pub async fn follow(&mut self, action_id: &str) -> Result<&Distilled> {
         let href = self.resolve_followable(action_id)?;
         let result = self.fetcher.fetch(&href).await?;
-        self.record(result);
+        self.record(result)?;
         self.snapshot_ref()
     }
 
@@ -127,18 +127,20 @@ impl Session {
         }
 
         let result = self.fetcher.submit(&form.action, method, &fields).await?;
-        self.record(result);
+        self.record(result)?;
         Ok(SubmitOutcome::Submitted)
     }
 
-    fn record(&mut self, result: FetchResult) {
+    fn record(&mut self, result: FetchResult) -> Result<()> {
+        let mut snap = distill_html(&result.html, &result.final_url, &self.opts)
+            .with_context(|| format!("distilling session snapshot for {}", result.final_url))?;
+        // distill_html stamps a synthetic 200; carry the real HTTP status.
+        snap.status = result.status;
+
         self.current_url = Some(result.final_url.clone());
-        self.redirect_history.push(result.final_url.clone());
-        if let Ok(mut snap) = distill_html(&result.html, &result.final_url, &self.opts) {
-            // distill_html stamps a synthetic 200; carry the real HTTP status.
-            snap.status = result.status;
-            self.last_snapshot = Some(snap);
-        }
+        self.redirect_history.push(result.final_url);
+        self.last_snapshot = Some(snap);
+        Ok(())
     }
 
     fn snapshot_ref(&self) -> Result<&Distilled> {

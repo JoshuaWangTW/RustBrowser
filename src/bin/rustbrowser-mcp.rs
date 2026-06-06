@@ -30,6 +30,8 @@ use rustbrowser::{DistillOptions, Distilled, JsMode, Profile, distill, distill_m
 /// One live browsing session, guarded so a single session's actions serialise.
 type SharedSession = Arc<AsyncMutex<Session>>;
 
+const MAX_LIVE_SESSIONS: usize = 64;
+
 #[derive(Clone)]
 struct RustBrowserServer {
     // Read by the `#[tool_handler]` macro's generated ServerHandler impl,
@@ -62,6 +64,53 @@ impl RustBrowserServer {
             .get(id)
             .cloned()
             .ok_or_else(|| rmcp::ErrorData::invalid_params(format!("unknown session '{id}'"), None))
+    }
+
+    fn ensure_session_capacity(&self) -> Result<(), rmcp::ErrorData> {
+        let len = self
+            .sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .len();
+        if len >= MAX_LIVE_SESSIONS {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "too many live sessions; close one with session_close first (limit {MAX_LIVE_SESSIONS})"
+                ),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_session(&self, id: String, session: Session) -> Result<(), rmcp::ErrorData> {
+        let mut sessions = self.sessions.lock().expect("session map mutex poisoned");
+        if sessions.len() >= MAX_LIVE_SESSIONS {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "too many live sessions; close one with session_close first (limit {MAX_LIVE_SESSIONS})"
+                ),
+                None,
+            ));
+        }
+        sessions.insert(id, Arc::new(AsyncMutex::new(session)));
+        Ok(())
+    }
+
+    fn close_session(&self, id: &str) -> Result<(), rmcp::ErrorData> {
+        let removed = self
+            .sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .remove(id);
+        if removed.is_some() {
+            Ok(())
+        } else {
+            Err(rmcp::ErrorData::invalid_params(
+                format!("unknown session '{id}'"),
+                None,
+            ))
+        }
     }
 }
 
@@ -270,6 +319,12 @@ struct SessionFollowParams {
     session_id: String,
     /// A `link_*` or `download_*` action id from the last snapshot.
     action_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SessionCloseParams {
+    /// The session id to close and forget.
+    session_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -611,6 +666,7 @@ impl RustBrowserServer {
         &self,
         Parameters(p): Parameters<SessionStartParams>,
     ) -> Result<String, rmcp::ErrorData> {
+        self.ensure_session_capacity()?;
         let mut session = Session::new(session_opts(&p))
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         session.observe(&p.url).await.map_err(|e| {
@@ -618,10 +674,7 @@ impl RustBrowserServer {
         })?;
         let id = Self::next_session_id();
         let view = session_view(&id, &session)?;
-        self.sessions
-            .lock()
-            .expect("session map mutex poisoned")
-            .insert(id, Arc::new(AsyncMutex::new(session)));
+        self.insert_session(id, session)?;
         Ok(view)
     }
 
@@ -655,6 +708,22 @@ impl RustBrowserServer {
             .await
             .map_err(|e| rmcp::ErrorData::invalid_params(format!("follow failed: {e}"), None))?;
         session_view(&p.session_id, &session)
+    }
+
+    #[tool(
+        description = "Close a SESSION and forget its cookies, current URL, history, and snapshot."
+    )]
+    async fn session_close(
+        &self,
+        Parameters(p): Parameters<SessionCloseParams>,
+    ) -> Result<String, rmcp::ErrorData> {
+        self.close_session(&p.session_id)?;
+        let view = json!({
+            "session_id": p.session_id,
+            "closed": true,
+        });
+        serde_json::to_string_pretty(&view)
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
     }
 
     #[tool(
@@ -700,8 +769,9 @@ impl ServerHandler for RustBrowserServer {
              plus an action tree (links/forms/buttons/downloads with stable action_ids). For \
              multi-step flows use a SESSION: session_start opens a page and keeps cookies + \
              history, then session_observe / session_follow / session_submit_form drive it by \
-             action_id (GET forms submit immediately; non-GET needs confirm=true). All return \
-             clean output instead of raw HTML, saving 75-98% of tokens.",
+             action_id (GET forms submit immediately; non-GET needs confirm=true). Use \
+             session_close to forget cookies and release the session. All return clean output \
+             instead of raw HTML, saving 75-98% of tokens.",
         )
     }
 }
@@ -901,6 +971,11 @@ mod tests {
                 "frozen SessionFollowParams field {key} missing"
             );
         }
+        let close = schema_props(schemars::schema_for!(SessionCloseParams));
+        assert!(
+            close.contains("session_id"),
+            "frozen SessionCloseParams field session_id missing"
+        );
         let submit = schema_props(schemars::schema_for!(SessionSubmitFormParams));
         for key in ["session_id", "form_id", "values", "confirm"] {
             assert!(

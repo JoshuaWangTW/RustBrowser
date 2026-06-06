@@ -12,14 +12,19 @@ observe.
 
 ### Added
 - **Sessions** (`Session` in the library; `session_start` / `session_observe` /
-  `session_follow` / `session_submit_form` MCP tools) — keep a cookie jar,
-  current URL, redirect history, and the last snapshot's action tree.
+  `session_follow` / `session_submit_form` / `session_close` MCP tools) — keep
+  a cookie jar, current URL, redirect history, and the last snapshot's action
+  tree.
 - **HTML form submission** — GET forms become a query string; POST forms send a
   urlencoded body. The form's own defaults (hidden CSRF fields, selected
   options) are merged with the caller's values automatically. POST is single-
   attempt (never silently retried).
 - **Dangerous-action confirmation** — a non-GET submit is described but **not
   sent** unless the caller passes `confirm=true`.
+- **Session lifecycle guardrails** — `session_close` forgets cookies/snapshots,
+  and the MCP server caps live sessions.
+- **POST redirect hardening** — 307/308 POST redirects only preserve submitted
+  body on same-origin hops; cross-origin body forwarding is blocked.
 - Every session request reuses the same SSRF-screened path as a plain fetch.
 
 ## [1.1.0]

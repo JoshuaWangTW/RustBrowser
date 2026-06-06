@@ -123,8 +123,12 @@ forms. The relevant safeguards:
   without an explicit go-ahead.
 - **POST is single-attempt** — a POST is never silently retried, so a
   non-idempotent action cannot be double-submitted by the retry logic.
+- **POST body redirects stay same-origin** — 307/308 redirects preserve method
+  and body under HTTP semantics, so RB blocks cross-origin 307/308 POST
+  redirects instead of forwarding submitted fields to a new origin.
 - **Cookies are in-memory and per-session** — they live only for the life of the
-  session object and are not written to disk.
+  session object and are not written to disk. `session_close` explicitly
+  forgets a session, and the MCP server caps the number of live sessions.
 
 ## Hardening checklist for operators
 

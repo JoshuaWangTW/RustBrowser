@@ -271,6 +271,17 @@ impl Fetcher {
                     bail!("too many redirects while requesting {url}");
                 }
                 if let Some(next) = redirect_target(&current, &resp, allow_local)? {
+                    if method == reqwest::Method::POST
+                        && form_body.is_some()
+                        && matches!(status.as_u16(), 307 | 308)
+                        && !same_origin(&current, &next)
+                    {
+                        bail!(
+                            "cross-origin POST redirect blocked: {} -> {}",
+                            origin_label(&current),
+                            origin_label(&next)
+                        );
+                    }
                     current = next;
                     // 307/308 preserve method + body; all others become GET.
                     if !matches!(status.as_u16(), 307 | 308) {
@@ -646,6 +657,20 @@ fn redirect_target(
         .with_context(|| format!("invalid redirect Location: {location}"))?;
     parse_and_validate_url_basics(next.as_str(), allow_local)?;
     Ok(Some(next))
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn origin_label(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("<unknown>");
+    match url.port_or_known_default() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    }
 }
 
 async fn read_limited_body(resp: &mut reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {

@@ -147,6 +147,93 @@ async fn post_form_needs_confirmation_then_submits() {
 }
 
 #[tokio::test]
+async fn post_redirect_does_not_forward_body_cross_origin() {
+    let source = MockServer::start().await;
+    let sink = MockServer::start().await;
+    home(&source).await;
+
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(
+            ResponseTemplate::new(307).insert_header("Location", format!("{}/steal", sink.uri())),
+        )
+        .mount(&source)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/steal"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string("<html><body><h1>Leaked</h1></body></html>"),
+        )
+        .mount(&sink)
+        .await;
+
+    let mut s = Session::new(opts()).unwrap();
+    s.observe(&format!("{}/", source.uri())).await.unwrap();
+    let values = [
+        ("user".to_string(), "alice".to_string()),
+        ("pass".to_string(), "secret".to_string()),
+    ];
+
+    let err = s
+        .submit_form("form_1", &values, true)
+        .await
+        .expect_err("cross-origin POST redirect must be blocked");
+
+    assert!(
+        err.to_string()
+            .contains("cross-origin POST redirect blocked")
+    );
+    assert!(
+        s.snapshot().unwrap().markdown.contains("Welcome"),
+        "failed submit should leave the previous snapshot intact"
+    );
+    let received = sink.received_requests().await.expect("recording enabled");
+    assert!(
+        received.is_empty(),
+        "form body was forwarded to redirected origin"
+    );
+}
+
+#[tokio::test]
+async fn failed_distill_does_not_advance_session_state() {
+    let server = MockServer::start().await;
+    home(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/no-heading"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string("<html><body><p>No selected heading here.</p></body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut s = Session::new(DistillOptions {
+        allow_local: true,
+        selector: Some("h1".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    let first_url = format!("{}/", server.uri());
+    s.observe(&first_url).await.unwrap();
+    assert_eq!(s.current_url(), Some(first_url.as_str()));
+    assert_eq!(s.redirect_history().len(), 1);
+    assert!(s.snapshot().unwrap().markdown.contains("Welcome"));
+
+    let err = s
+        .observe(&format!("{}/no-heading", server.uri()))
+        .await
+        .expect_err("selector miss should fail");
+
+    assert!(format!("{err:#}").contains("selector 'h1' matched no elements"));
+    assert_eq!(s.current_url(), Some(first_url.as_str()));
+    assert_eq!(s.redirect_history().len(), 1);
+    assert!(s.snapshot().unwrap().markdown.contains("Welcome"));
+}
+
+#[tokio::test]
 async fn cookies_persist_across_requests() {
     let server = MockServer::start().await;
     home(&server).await; // sets Set-Cookie: sid=abc123
