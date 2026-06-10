@@ -10,6 +10,7 @@ pub mod cache;
 pub mod convert;
 pub mod extract;
 pub mod fetch;
+pub mod planner;
 pub mod render;
 #[cfg(feature = "robots")]
 pub mod robots;

@@ -5,6 +5,44 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.3.0]
+
+Third Browser-Use step: the **Action Loop** — every session reply is now a
+planner-friendly view, idempotent steps are verified and retried within bounds,
+and a debug log records what happened.
+
+### Added
+- **Planner-friendly session view** — session tools now also return a `loop`
+  object: `state` (url/status/title/excerpt + health flags), `available_actions`
+  (links/forms/buttons/downloads flattened to one shape with `action_id`, `kind`,
+  `label`, `target`, form `method`/`fields`, and a `dangerous` flag), and
+  `recommended_next_actions` (cheap heuristics pointing at real `action_id`s —
+  hints only, never auto-executed).
+- **Verify step + bounded auto-retry** — after an idempotent step (observe /
+  follow / GET submit) the snapshot is verified; a retryable failure (429/5xx or
+  a transient transport error) is retried up to `max_action_retries` times
+  (`session_start` param; default 1, capped at 2), honouring per-host rate
+  limits. Each loop attempt is one HTTP attempt, so the retry budget is not
+  multiplied by lower-level fetch retries; retries back off exponentially (with
+  jitter) and honour the server's `Retry-After`. A discarded retry never
+  advances session state. `failure_reason` surfaces an HTTP error to the
+  planner.
+- **Operation log** — a per-session `operation_log` (step/op/target/status/
+  attempt/outcome/failure_reason) for debugging the loop.
+- New library surface: `rustbrowser::planner` (`LoopView`, `PageState`,
+  `AvailableAction`, `RecommendedAction`, `OpLogEntry`, `verify`),
+  `Session::loop_view` / `log` / `last_failure` / `with_max_action_retries`.
+
+### Safety
+- **Dangerous (non-GET) submits are never auto-executed or auto-retried** — the
+  confirmation gate is unchanged and the retry path applies only to idempotent
+  steps.
+
+### Compatibility
+- The session view is **additive**: the 1.x fields (`session_id`, `current_url`,
+  `redirect_history`, `snapshot`) are unchanged; `loop` and `operation_log` are
+  added alongside them.
+
 ## [1.2.0]
 
 Second Browser-Use step: **stateful sessions** so an agent can act, not just

@@ -194,6 +194,37 @@ rustbrowser fetch <url> --actions --max-actions 30
 
 > 設計刻意**不做** pixel-level click、不做完整 JS browser、不讓 agent 未經確認就送任意 POST。後續版本(session、表單提交、action loop、Chrome fallback broker)見 [`CHANGELOG.md`](CHANGELOG.md) 與內部路線圖。
 
+## Browser Use:Action Loop(v1.3)
+
+v1.2 讓 session 能 **act**;v1.3 把每次 act 的回傳整理成 **planner-friendly** 格式,讓 LLM 能穩定地跑 Observe → Act → **Verify** 迴圈,而不必每步重讀整包 `Distilled`。每個 session 工具(`session_start`/`session_observe`/`session_follow`/`session_submit_form`)的回傳,在既有欄位之外**新增**:
+
+- **`loop`** —— 規劃用的精簡視圖:
+  - `state` —— 目前頁面(url / status / title / excerpt / content_chars / action_count / low_content / used_headless / steps_taken)。
+  - `available_actions` —— 把 links/forms/buttons/downloads **攤平成統一形狀**,各帶 `action_id`、`kind`、`label`、`target`、(表單的)`method` 與可填 `fields`,以及 `dangerous`(非 GET 標記)。表單 `fields` 只列 caller 應填欄位;hidden/default 欄位仍由 RB 內部自動帶上。
+  - `recommended_next_actions` —— 便宜誠實的啟發式提示(像是「這看起來是搜尋表單 / 下一頁連結」),指向真實 `action_id`。**只是提示,RB 不會自動執行**。
+  - `failure_reason` —— 該步驟未通過 verify(HTTP 錯誤狀態)時才有;`None` 代表看起來正常。
+- **`operation_log`** —— 每步操作的除錯紀錄(step / op / target / status / attempt / outcome / failure_reason),供 debug 與改版用。
+
+**Verify + 有限自動重試**:idempotent 步驟(observe / follow / GET 表單)抓完會做 verify;遇到**可重試**的暫時性失敗(429/5xx,或暫時性連線錯誤)會再試最多 `max_action_retries` 次(預設 1,上限 2),且維持 per-host rate limit。session 內每個 loop attempt 對應一次 HTTP attempt,不會再疊加底層 fetch retry;重試之間會**指數退避**(含 jitter)並尊重伺服器的 `Retry-After`。被丟棄的重試嘗試**不會推進 session 狀態**(`redirect_history` 每次成功導航仍只記一筆)。**高風險(非 GET)提交永遠不會被自動執行,也永遠不會被自動重試。**
+
+```jsonc
+// session_start(url, max_action_retries=2) 之後的回傳(節錄)
+{
+  "session_id": "sess_0",
+  "loop": {
+    "state": { "status": 200, "title": "Search", "action_count": 12, "low_content": false, "steps_taken": 1 },
+    "available_actions": [
+      { "action_id": "form_0", "kind": "form", "method": "GET", "fields": ["q"], "target": "https://e.com/search" },
+      { "action_id": "form_1", "kind": "form", "method": "POST", "dangerous": true, "fields": ["user", "pass"] }
+    ],
+    "recommended_next_actions": [
+      { "action_id": "form_0", "kind": "form", "why": "search/filter form (GET) — submit it to query the site" }
+    ]
+  },
+  "operation_log": [ { "step": 1, "op": "observe", "status": 200, "attempt": 1, "outcome": "ok" } ]
+}
+```
+
 ## 使用方式:給 Claude Code 用(MCP)
 
 `rustbrowser-mcp` 是 stdio MCP server,暴露三個工具,Claude 呼叫即可拿到精簡內容,**原始 HTML 完全不進對話**:
@@ -277,6 +308,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v1.0(穩定版)** — CLI/MCP schema 凍結(+ 守門測試)· 完整安全文件(`SECURITY.md`)· semver 承諾 + `CHANGELOG.md` · CI 覆蓋 Linux/Windows/macOS · 三平台 release binaries + checksums
 - ✅ **v1.1(Actionable Observe)** — action tree(links/forms/buttons/downloads + 穩定 action_id)· MCP `observe_url` 工具 · action token 上限 · action 抽取評測。Browser Use 的第一步:RB 先能告訴 agent「這頁有哪些可操作的東西」
 - ✅ **v1.2(Session + Static Actions)** — 有狀態 session(cookie jar / current URL / redirect history / last snapshot)· MCP `session_start`/`session_observe`/`session_follow`/`session_submit_form`/`session_close` · HTML 表單提交(GET 帶 query、POST 帶 body,自動帶 hidden/selected 預設值)· 高風險(非 GET)action 需 `confirm=true` 才送 · 跨 origin 307/308 POST body 轉送會被阻擋。Browser Use 第二步:能 act,不只 observe
+- ✅ **v1.3(Action Loop)** — planner-friendly 回傳(`loop`:`state` / `available_actions` / `recommended_next_actions` / `failure_reason`)· idempotent 步驟 verify + 有限自動重試(`max_action_retries`,預設 1、上限 2;每個 loop attempt 一次 HTTP attempt;高風險 action 永不自動重試)· 操作紀錄 `operation_log`。Browser Use 第三步:把 Observe → Act → **Verify** 收成可規劃的迴圈
 
 ## 技術棧
 
