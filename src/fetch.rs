@@ -159,6 +159,17 @@ impl Fetcher {
         self.fetch_with_retries(url, start).await
     }
 
+    /// One single HTTP attempt — no transport-level retries — returning the
+    /// result plus any `Retry-After` the server sent. The session Action Loop
+    /// drives its own bounded retry around this, so one loop attempt is exactly
+    /// one network request and the server's requested delay is still honoured
+    /// between loop attempts. Same SSRF screening and per-hop checks as `fetch`.
+    pub(crate) async fn fetch_attempt(&self, url: &str) -> Result<(FetchResult, Option<Duration>)> {
+        let start = parse_and_validate_url_basics(url, self.opts.allow_local)?;
+        let attempt = self.fetch_once(url, start, None).await?;
+        Ok((attempt.res, attempt.retry_after))
+    }
+
     /// Submit a form. `Get` appends the fields as the query string and reuses the
     /// full retried GET path; `Post` sends a urlencoded body in a **single
     /// attempt** — POST is non-idempotent and must never be silently re-sent.
@@ -328,8 +339,10 @@ pub async fn fetch(url: &str, opts: &FetchOptions) -> Result<FetchResult> {
 }
 
 /// Build `action_url` with `fields` as its query string. HTML GET-form semantics:
-/// the submitted data replaces any query already on the action URL.
-fn build_query_url(action_url: &str, fields: &[(String, String)]) -> Result<String> {
+/// the submitted data replaces any query already on the action URL. `pub(crate)`
+/// so the session's GET form submit can build the URL once and drive it through
+/// the Action Loop's verified/retried path.
+pub(crate) fn build_query_url(action_url: &str, fields: &[(String, String)]) -> Result<String> {
     let mut url =
         Url::parse(action_url).with_context(|| format!("invalid form action: {action_url}"))?;
     url.set_query(None);
@@ -458,8 +471,9 @@ pub(crate) fn is_transient_error(e: &anyhow::Error) -> bool {
 }
 
 /// Exponential backoff (base 200 ms, doubling, capped at 10 s) plus clock-seeded
-/// jitter — no RNG dependency needed for a backoff delay.
-fn backoff_delay(attempt: usize) -> Duration {
+/// jitter — no RNG dependency needed for a backoff delay. `pub(crate)` so the
+/// session's Action Loop backs off identically between its own retries.
+pub(crate) fn backoff_delay(attempt: usize) -> Duration {
     let base_ms = 200u64.saturating_mul(1u64 << attempt.min(6)).min(10_000);
     Duration::from_millis(base_ms + jitter_ms(base_ms))
 }

@@ -49,7 +49,8 @@ pub struct PageState {
     pub low_content: bool,
     /// Headless rendering was used for this page.
     pub used_headless: bool,
-    /// How many session steps have been taken so far (logged operations).
+    /// How many operations (observe / follow / submit_form) the session has
+    /// run so far. Retry attempts within an operation do not add steps.
     pub steps_taken: usize,
 }
 
@@ -87,7 +88,8 @@ pub struct AvailableAction {
     /// (non-GET form submits). Such actions are never auto-executed or retried.
     #[serde(skip_serializing_if = "is_false")]
     pub dangerous: bool,
-    /// For forms: the field names a caller may fill.
+    /// For forms: field names a caller may fill. Hidden/default-only controls
+    /// are intentionally omitted; RB still carries their defaults internally.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<String>,
 }
@@ -103,7 +105,8 @@ pub struct RecommendedAction {
 /// One recorded operation in a session's debug log.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpLogEntry {
-    /// Monotonic step counter within the session.
+    /// The logical operation this entry belongs to (1-based, monotonic).
+    /// Retries of the same operation share a step; `attempt` tells them apart.
     pub step: usize,
     /// `observe`, `follow`, or `submit_form`.
     pub op: String,
@@ -195,7 +198,12 @@ fn flatten_actions(tree: &ActionTree) -> Vec<AvailableAction> {
             target: Some(f.action.clone()),
             method: Some(f.method.clone()),
             dangerous: is_dangerous_method(&f.method),
-            fields: f.fields.iter().map(|fl| fl.name.clone()).collect(),
+            fields: f
+                .fields
+                .iter()
+                .filter(|fl| is_fillable_field(&fl.name, &fl.kind))
+                .map(|fl| fl.name.clone())
+                .collect(),
         });
     }
     for b in &tree.buttons {
@@ -224,8 +232,9 @@ fn flatten_actions(tree: &ActionTree) -> Vec<AvailableAction> {
     out
 }
 
-/// Cheap, honest "what next" hints pointing at real `action_id`s. At most three:
-/// a GET search/filter form, a pagination/next link, then the first link.
+/// Cheap, honest "what next" hints pointing at real `action_id`s. At most two:
+/// a GET search/filter form and/or a pagination/next link, falling back to the
+/// first link only when neither matched.
 fn recommend(tree: &ActionTree) -> Vec<RecommendedAction> {
     let mut recs = Vec::new();
 
@@ -265,6 +274,16 @@ fn recommend(tree: &ActionTree) -> Vec<RecommendedAction> {
 /// Anything other than GET is a "dangerous" action RB will not run unconfirmed.
 fn is_dangerous_method(method: &str) -> bool {
     !method.eq_ignore_ascii_case("GET")
+}
+
+fn is_fillable_field(name: &str, kind: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    !matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "hidden" | "submit" | "button" | "reset" | "image"
+    )
 }
 
 fn form_looks_searchy(form: &FormAction) -> bool {
@@ -349,7 +368,13 @@ mod tests {
                     method: "POST".to_string(),
                     action: "https://e.com/login".to_string(),
                     submit_id: "form_1.submit".to_string(),
-                    fields: vec![field("user", "text"), field("pass", "password")],
+                    fields: vec![
+                        field("csrf", "hidden"),
+                        field("user", "text"),
+                        field("pass", "password"),
+                        field("submit", "submit"),
+                        field("", "text"),
+                    ],
                 },
             ],
             buttons: vec![ButtonAction {

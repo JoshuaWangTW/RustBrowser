@@ -21,7 +21,7 @@ use rmcp::{
     transport::stdio,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use rustbrowser::session::{Session, SubmitOutcome};
@@ -122,15 +122,45 @@ const SESSION_LOG_TAIL: usize = 25;
 /// The original 1.x fields (`session_id`, `current_url`, `redirect_history`,
 /// `snapshot`) are kept for compatibility; the Action-Loop view (`loop`) and the
 /// debug `operation_log` are **added** on top (see docs/API.md).
-fn session_view(id: &str, session: &Session) -> Result<String, rmcp::ErrorData> {
-    let view = json!({
+fn session_view_value(id: &str, session: &Session) -> Value {
+    json!({
         "session_id": id,
         "current_url": session.current_url(),
         "redirect_history": session.redirect_history(),
         "snapshot": session.snapshot(),
         "loop": session.loop_view(),
         "operation_log": session.recent_log(SESSION_LOG_TAIL),
-    });
+    })
+}
+
+fn session_view(id: &str, session: &Session) -> Result<String, rmcp::ErrorData> {
+    let view = session_view_value(id, session);
+    serde_json::to_string_pretty(&view)
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+}
+
+fn session_confirmation_view(
+    id: &str,
+    session: &Session,
+    method: String,
+    action: String,
+    fields: Vec<(String, String)>,
+) -> Result<String, rmcp::ErrorData> {
+    let mut view = session_view_value(id, session);
+    let obj = view
+        .as_object_mut()
+        .expect("session_view_value always returns a JSON object");
+    obj.insert("needs_confirmation".to_string(), json!(true));
+    obj.insert(
+        "message".to_string(),
+        json!(
+            "Dangerous (non-GET) submit withheld. Re-call session_submit_form with confirm=true to send it."
+        ),
+    );
+    obj.insert(
+        "would_submit".to_string(),
+        json!({ "method": method, "action": action, "fields": fields }),
+    );
     serde_json::to_string_pretty(&view)
         .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
 }
@@ -762,16 +792,7 @@ impl RustBrowserServer {
                 method,
                 action,
                 fields,
-            } => {
-                let view = json!({
-                    "session_id": p.session_id,
-                    "needs_confirmation": true,
-                    "message": "Dangerous (non-GET) submit withheld. Re-call session_submit_form with confirm=true to send it.",
-                    "would_submit": { "method": method, "action": action, "fields": fields },
-                });
-                serde_json::to_string_pretty(&view)
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
-            }
+            } => session_confirmation_view(&p.session_id, &session, method, action, fields),
         }
     }
 }
@@ -874,6 +895,27 @@ mod tests {
         assert!(!is_clean_startup_disconnect(&DisplayErr(
             "failed to bind stdio transport"
         )));
+    }
+
+    #[test]
+    fn confirmation_view_keeps_action_loop_state() {
+        let session = Session::new(DistillOptions::default()).unwrap();
+        let out = session_confirmation_view(
+            "sess_test",
+            &session,
+            "POST".to_string(),
+            "https://example.com/login".to_string(),
+            vec![("csrf".to_string(), "tok".to_string())],
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(value["session_id"], "sess_test");
+        assert_eq!(value["needs_confirmation"], true);
+        assert!(value.get("would_submit").is_some());
+        assert!(value.get("loop").is_some());
+        assert!(value.get("operation_log").is_some());
+        assert!(value.get("snapshot").is_some());
     }
 
     /// Property names present in a generated JSON schema's `properties` object.

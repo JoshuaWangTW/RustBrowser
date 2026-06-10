@@ -22,8 +22,11 @@ and a debug log records what happened.
   follow / GET submit) the snapshot is verified; a retryable failure (429/5xx or
   a transient transport error) is retried up to `max_action_retries` times
   (`session_start` param; default 1, capped at 2), honouring per-host rate
-  limits. A discarded retry never advances session state. `failure_reason`
-  surfaces an HTTP error to the planner.
+  limits. Each loop attempt is one HTTP attempt, so the retry budget is not
+  multiplied by lower-level fetch retries; retries back off exponentially (with
+  jitter) and honour the server's `Retry-After`. A discarded retry never
+  advances session state. `failure_reason` surfaces an HTTP error to the
+  planner.
 - **Operation log** — a per-session `operation_log` (step/op/target/status/
   attempt/outcome/failure_reason) for debugging the loop.
 - New library surface: `rustbrowser::planner` (`LoopView`, `PageState`,

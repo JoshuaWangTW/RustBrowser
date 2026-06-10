@@ -17,9 +17,10 @@
 //! Safety: every request reuses the same SSRF-screened path as plain fetches.
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::time::sleep;
 
 use crate::actions::FormAction;
-use crate::fetch::{FetchOptions, FetchResult, Fetcher, SubmitMethod};
+use crate::fetch::{self, FetchOptions, FetchResult, Fetcher, SubmitMethod};
 use crate::planner::{self, LoopView, OpLogEntry};
 use crate::{DistillOptions, Distilled, distill_html};
 
@@ -46,7 +47,8 @@ pub struct Session {
     last_failure: Option<String>,
     /// Operation log for debugging the loop.
     log: Vec<OpLogEntry>,
-    /// Monotonic step counter (also the number of logged operations).
+    /// Logical operation counter: one per observe/follow/submit_form call.
+    /// Every log entry an operation produces (retries included) shares it.
     step: usize,
 }
 
@@ -64,17 +66,6 @@ pub enum SubmitOutcome {
     },
 }
 
-/// How to perform one idempotent fetch inside the verify/retry loop.
-enum Step<'a> {
-    /// Plain GET of a URL (observe / follow).
-    Get(&'a str),
-    /// GET form submit: fields become the query string.
-    SubmitGet {
-        action: &'a str,
-        fields: &'a [(String, String)],
-    },
-}
-
 impl Session {
     /// Start a session. The given options seed every snapshot; cookies persist
     /// across requests and the action tree is always extracted.
@@ -83,7 +74,10 @@ impl Session {
             timeout: opts.timeout,
             max_bytes: opts.max_bytes,
             allow_local: opts.allow_local,
-            max_retries: opts.max_retries,
+            // The Action Loop owns the per-step retry budget. Keep each loop
+            // attempt to one HTTP attempt so `max_action_retries` maps directly
+            // to actual network retries.
+            max_retries: 0,
             per_host_concurrency: opts.per_host_concurrency,
             min_request_interval: opts.min_request_interval,
             respect_robots: opts.respect_robots,
@@ -162,16 +156,14 @@ impl Session {
     /// Fetch `url` and make it the current snapshot (idempotent: verified +
     /// retried on a transient failure).
     pub async fn observe(&mut self, url: &str) -> Result<&Distilled> {
-        self.run_idempotent("observe", url.to_string(), Step::Get(url))
-            .await
+        self.run_idempotent("observe", url.to_string(), url).await
     }
 
     /// Follow a `link_*` / `download_*` action from the last snapshot
     /// (idempotent: verified + retried on a transient failure).
     pub async fn follow(&mut self, action_id: &str) -> Result<&Distilled> {
         let href = self.resolve_followable(action_id)?;
-        self.run_idempotent("follow", href.clone(), Step::Get(&href))
-            .await
+        self.run_idempotent("follow", href.clone(), &href).await
     }
 
     /// Submit a `form_*` from the last snapshot, merging the form's own default
@@ -193,6 +185,7 @@ impl Session {
 
         // Non-GET is a dangerous action: never auto-execute without confirmation.
         if method != SubmitMethod::Get && !confirm {
+            self.begin_step();
             self.log_attempt(
                 "submit_form",
                 &form.action,
@@ -208,21 +201,17 @@ impl Session {
             });
         }
 
-        // GET form submit is idempotent: verify + limited retry like observe.
+        // GET form submit is idempotent: the fields become the query string and
+        // the step is verified + retried like an observe.
         if method == SubmitMethod::Get {
-            self.run_idempotent(
-                "submit_form",
-                form.action.clone(),
-                Step::SubmitGet {
-                    action: &form.action,
-                    fields: &fields,
-                },
-            )
-            .await?;
+            let url = fetch::build_query_url(&form.action, &fields)?;
+            self.run_idempotent("submit_form", form.action.clone(), &url)
+                .await?;
             return Ok(SubmitOutcome::Submitted);
         }
 
         // Confirmed non-GET: a single attempt, never silently retried.
+        self.begin_step();
         let result = match self.fetcher.submit(&form.action, method, &fields).await {
             Ok(r) => r,
             Err(e) => {
@@ -237,52 +226,26 @@ impl Session {
                 return Err(e);
             }
         };
-        let status = result.status;
-        if let Err(e) = self.record(result) {
-            self.log_attempt(
-                "submit_form",
-                &form.action,
-                Some(status),
-                1,
-                "distill_failed",
-                Some(short_err(&e)),
-            );
-            return Err(e);
-        }
-        let failure = self.last_snapshot.as_ref().and_then(planner::verify);
-        self.last_failure = failure.clone();
-        self.commit_navigation();
-        self.log_attempt(
-            "submit_form",
-            &form.action,
-            Some(status),
-            1,
-            outcome_label(&failure),
-            failure,
-        );
+        self.settle("submit_form", &form.action, 1, result)?;
         Ok(SubmitOutcome::Submitted)
     }
 
-    /// Run an idempotent step with verify + bounded retry. Only the result we
-    /// actually keep is recorded, so a discarded retryable attempt never advances
-    /// session state, and `redirect_history` gets one entry per settled
-    /// navigation.
-    async fn run_idempotent(
-        &mut self,
-        op: &str,
-        target: String,
-        step: Step<'_>,
-    ) -> Result<&Distilled> {
+    /// Run an idempotent step (a GET of `url`) with verify + bounded retry. Only
+    /// the result we actually keep is recorded, so a discarded retryable attempt
+    /// never advances session state, and `redirect_history` gets one entry per
+    /// settled navigation. Retries back off — honouring the server's
+    /// `Retry-After` when it sent one — so the loop never hammers a host that
+    /// just asked us to slow down.
+    async fn run_idempotent(&mut self, op: &str, target: String, url: &str) -> Result<&Distilled> {
+        self.begin_step();
         let mut attempt = 0usize;
         loop {
-            match self.do_fetch(&step).await {
-                Ok(result) => {
+            match self.fetcher.fetch_attempt(url).await {
+                Ok((result, retry_after)) => {
                     let status = result.status;
                     // Server said "try later" and we still have budget: discard
-                    // this response (don't advance state) and retry.
-                    if attempt < self.max_action_retries
-                        && crate::fetch::is_retryable_status(status)
-                    {
+                    // this response (don't advance state), back off, retry.
+                    if attempt < self.max_action_retries && fetch::is_retryable_status(status) {
                         self.log_attempt(
                             op,
                             &target,
@@ -291,40 +254,18 @@ impl Session {
                             "retryable_status",
                             Some(format!("http_status_{status}")),
                         );
+                        sleep(retry_after.unwrap_or_else(|| fetch::backoff_delay(attempt))).await;
                         attempt += 1;
                         continue;
                     }
-                    // Keep this result. record() is atomic: on a distill failure
-                    // it returns Err without mutating state.
-                    if let Err(e) = self.record(result) {
-                        self.log_attempt(
-                            op,
-                            &target,
-                            Some(status),
-                            attempt + 1,
-                            "distill_failed",
-                            Some(short_err(&e)),
-                        );
-                        return Err(e);
-                    }
-                    let failure = self.last_snapshot.as_ref().and_then(planner::verify);
-                    self.last_failure = failure.clone();
-                    self.commit_navigation();
-                    self.log_attempt(
-                        op,
-                        &target,
-                        Some(status),
-                        attempt + 1,
-                        outcome_label(&failure),
-                        failure,
-                    );
+                    // Keep this result.
+                    self.settle(op, &target, attempt + 1, result)?;
                     return self.snapshot_ref();
                 }
                 Err(e) => {
-                    // A transient transport error (the fetcher already exhausted
-                    // its own transport retries) gets one more whole-step try.
-                    let retry =
-                        attempt < self.max_action_retries && crate::fetch::is_transient_error(&e);
+                    // A transient transport error gets one more whole-step try
+                    // under the Action Loop budget.
+                    let retry = attempt < self.max_action_retries && fetch::is_transient_error(&e);
                     self.log_attempt(
                         op,
                         &target,
@@ -338,6 +279,7 @@ impl Session {
                         Some(short_err(&e)),
                     );
                     if retry {
+                        sleep(fetch::backoff_delay(attempt)).await;
                         attempt += 1;
                         continue;
                     }
@@ -347,15 +289,41 @@ impl Session {
         }
     }
 
-    /// Perform one fetch for a [`Step`]. Borrows only the client, so the caller
-    /// can mutate session state with the owned result afterwards.
-    async fn do_fetch(&self, step: &Step<'_>) -> Result<FetchResult> {
-        match step {
-            Step::Get(url) => self.fetcher.fetch(url).await,
-            Step::SubmitGet { action, fields } => {
-                self.fetcher.submit(action, SubmitMethod::Get, fields).await
-            }
+    /// Keep a settled fetch result: distill it into the snapshot (atomic — a
+    /// distill failure leaves prior state intact), verify it, commit the
+    /// navigation to history, and log the outcome. Shared by the idempotent
+    /// retry loop and the single-attempt confirmed non-GET submit.
+    fn settle(
+        &mut self,
+        op: &str,
+        target: &str,
+        attempt: usize,
+        result: FetchResult,
+    ) -> Result<()> {
+        let status = result.status;
+        if let Err(e) = self.record(result) {
+            self.log_attempt(
+                op,
+                target,
+                Some(status),
+                attempt,
+                "distill_failed",
+                Some(short_err(&e)),
+            );
+            return Err(e);
         }
+        let failure = self.last_snapshot.as_ref().and_then(planner::verify);
+        self.last_failure = failure.clone();
+        self.commit_navigation();
+        self.log_attempt(
+            op,
+            target,
+            Some(status),
+            attempt,
+            outcome_label(&failure),
+            failure,
+        );
+        Ok(())
     }
 
     /// Distill `result` into the current snapshot. Atomic: distills first, then
@@ -381,6 +349,13 @@ impl Session {
         }
     }
 
+    /// Start a new logical operation: every log entry it produces — including
+    /// discarded retry attempts — shares this step number, with `attempt`
+    /// telling them apart.
+    fn begin_step(&mut self) {
+        self.step += 1;
+    }
+
     fn log_attempt(
         &mut self,
         op: &str,
@@ -390,7 +365,6 @@ impl Session {
         outcome: &str,
         failure_reason: Option<String>,
     ) {
-        self.step += 1;
         self.log.push(OpLogEntry {
             step: self.step,
             op: op.to_string(),

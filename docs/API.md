@@ -109,7 +109,7 @@ it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 (both additive):
 
 - `loop.state` — `{url?, status, title, excerpt?, content_chars, action_count, low_content, used_headless, steps_taken}`.
-- `loop.available_actions` — array of `{action_id, kind, label, target?, method?, dangerous?, fields?}` (links/forms/buttons/downloads flattened).
+- `loop.available_actions` — array of `{action_id, kind, label, target?, method?, dangerous?, fields?}` (links/forms/buttons/downloads flattened). For forms, `fields` lists caller-fillable names only; hidden/default fields are still carried internally when submitting.
 - `loop.recommended_next_actions` — array of `{action_id, kind, why}` (heuristic hints, never auto-executed).
 - `loop.failure_reason` — string, present only when the last step failed verification (an HTTP error status).
 - `operation_log` — recent array of `{step, op, target, status?, attempt, outcome, failure_reason?}`.
@@ -121,13 +121,15 @@ it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 | `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries` | Opens `url`, returns a `session_id` + first snapshot + `loop`. |
 | `session_observe` | `session_id`, `url` | Navigate the session to `url` (keeps cookies). |
 | `session_follow` | `session_id`, `action_id` | Follow a `link_*`/`download_*` from the last snapshot. |
-| `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns `{needs_confirmation, would_submit}`). |
+| `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns the session view plus `{needs_confirmation, would_submit}`). |
 | `session_close` | `session_id` | Close a session and forget its cookies, URL, history, and snapshot. |
 
 `max_action_retries` (default `1`, clamped to `0`–`2`) gives an idempotent step
 (observe / follow / GET submit) extra attempts when it fails verification
-(429/5xx or a transient transport error). A non-GET submit is **never**
-auto-retried.
+(429/5xx or a transient transport error). In sessions, each loop attempt maps
+to one HTTP attempt; low-level fetch retries are disabled so this budget is not
+multiplied. Retries back off exponentially (with jitter) and honour the
+server's `Retry-After`. A non-GET submit is **never** auto-retried.
 
 ## JSON output schema (`Distilled`)
 
