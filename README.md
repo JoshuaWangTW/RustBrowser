@@ -323,6 +323,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v1.2(Session + Static Actions)** — 有狀態 session(cookie jar / current URL / redirect history / last snapshot)· MCP `session_start`/`session_observe`/`session_follow`/`session_submit_form`/`session_close` · HTML 表單提交(GET 帶 query、POST 帶 body,自動帶 hidden/selected 預設值)· 高風險(非 GET)action 需 `confirm=true` 才送 · 跨 origin 307/308 POST body 轉送會被阻擋。Browser Use 第二步:能 act,不只 observe
 - ✅ **v1.3(Action Loop)** — planner-friendly 回傳(`loop`:`state` / `available_actions` / `recommended_next_actions` / `failure_reason`)· idempotent 步驟 verify + 有限自動重試(`max_action_retries`,預設 1、上限 2;每個 loop attempt 一次 HTTP attempt;高風險 action 永不自動重試)· 操作紀錄 `operation_log`。Browser Use 第三步:把 Observe → Act → **Verify** 收成可規劃的迴圈
 - ✅ **v1.4(Chrome Fallback Broker)** — 明確可解釋的 fallback 決策(`challenge` / `js_app` / `no_actions` / `forced`)· session idempotent 步驟自動升級**一次**有界 headless render,rendered DOM 重走同一條蒸餾管線(絕不回 raw DOM/截圖)· 確認後的非 GET 結果頁永不被瀏覽器重抓 · `session_start` 加 `js` / `js_wait`。Browser Use 第四步:RB 解不了 → 才進 Chrome,而且說得出為什麼
+- ✅ **v1.5(Safety + Eval)** — browser-use benchmark(`tests/benchmark.rs`):六種任務原型(搜尋頁 / 文件站 / 分頁列表 / 表單提交 / 登入後頁面 / JS-heavy SPA)走真實 Session,量測 RB-only 率、fallback 率、request 數、token cost、unsafe-action block、延遲,並鎖定路線圖目標:**一般查找/文件/搜尋型任務 ≥70% 不進 Chrome**(固定評測集上 100%)、危險提交 100% 先擋。Browser Use 第五步:迴圈的行為從「斷言」變成「可量測」
 
 ## 技術棧
 

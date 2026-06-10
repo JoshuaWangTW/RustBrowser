@@ -5,6 +5,24 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.5.0]
+
+Fifth (final roadmap) Browser-Use step: **Safety + Eval** — the loop's
+behaviour is now measured, not just asserted.
+
+### Added
+- **Browser-Use benchmark** (`tests/benchmark.rs`) — six task archetypes from
+  the roadmap (search page, docs site, paginated list, form submit,
+  login-then-fetch, JS-heavy SPA), each driven through the real `Session`
+  against deterministic wiremock sites.
+- **Metrics per task**: RB-only vs Chrome-fallback, HTTP request count, output
+  tokens, unsafe-action blocks, steps, latency — printed as a table in test
+  logs.
+- **Locked targets**: ordinary lookup / docs / search tasks stay **RB-only
+  (≥ 70% roadmap bar — 100% on the fixed suite)**; the SPA archetype is the
+  only one that engages the fallback broker; every dangerous submit is blocked
+  until explicitly confirmed.
+
 ## [1.4.0]
 
 Fourth Browser-Use step: the **Chrome Fallback Broker** — RB stays first, and
