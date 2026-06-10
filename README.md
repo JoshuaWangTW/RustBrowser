@@ -225,6 +225,19 @@ v1.2 讓 session 能 **act**;v1.3 把每次 act 的回傳整理成 **planner-fri
 }
 ```
 
+## Browser Use:Chrome Fallback Broker(v1.4)
+
+Fallback Policy 的嚴格分層:**RB 解不了 → 才進 Chrome**。v1.4 把「什麼時候算解不了」變成**明確、可解釋的決策**(`rustbrowser::fallback`),不再是黑箱模式切換:
+
+- **fallback 條件**(`loop.state.fallback_reason` 會告訴你是哪一個):
+  - `challenge` —— 偵測到反機器人/captcha 插頁(reCAPTCHA / hCaptcha / Cloudflare Turnstile 等標記)。真瀏覽器可能通過 JS challenge;真 captcha 則需要更高層(planner 自行判斷要不要賭)。
+  - `js_app` —— 未渲染的 client-side app(框架標記 / script-heavy 殼 / canvas / shadow DOM)且萃取內容過薄。
+  - `no_actions` —— 要求 action tree 卻一個可操作元素都沒有,而頁面明顯在跑 script(表單/連結由 JS 動態生成)。
+  - `forced` —— `js=always` 強制。
+- **升級行為**:session 的 idempotent 步驟 settle 後,broker 對該 URL 跑**一次**有界 headless render(沿用既有 sandbox + DOM 上限),rendered DOM **重新走同一條 token-lean 蒸餾管線** —— LLM 拿到的仍是壓縮後的內容 + action tree,**絕不塞 raw DOM 或截圖**。render 失敗非致命(保留 HTTP snapshot,log 記 `chrome_fallback_failed`)。
+- **安全邊界**:只有 idempotent 步驟會升級;**已確認的非 GET 提交結果頁絕不會被瀏覽器重抓**。fallback 瀏覽器是獨立行程,**不帶 session cookies**(登入牆後頁面可能渲染不同 —— planner 可由 `fallback_reason` + `used_headless` 判讀)。
+- **控制**:`session_start` 的 `js`(off / auto 預設 / always)與 `js_wait`(毫秒)。
+
 ## 使用方式:給 Claude Code 用(MCP)
 
 `rustbrowser-mcp` 是 stdio MCP server,暴露三個工具,Claude 呼叫即可拿到精簡內容,**原始 HTML 完全不進對話**:
@@ -309,6 +322,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v1.1(Actionable Observe)** — action tree(links/forms/buttons/downloads + 穩定 action_id)· MCP `observe_url` 工具 · action token 上限 · action 抽取評測。Browser Use 的第一步:RB 先能告訴 agent「這頁有哪些可操作的東西」
 - ✅ **v1.2(Session + Static Actions)** — 有狀態 session(cookie jar / current URL / redirect history / last snapshot)· MCP `session_start`/`session_observe`/`session_follow`/`session_submit_form`/`session_close` · HTML 表單提交(GET 帶 query、POST 帶 body,自動帶 hidden/selected 預設值)· 高風險(非 GET)action 需 `confirm=true` 才送 · 跨 origin 307/308 POST body 轉送會被阻擋。Browser Use 第二步:能 act,不只 observe
 - ✅ **v1.3(Action Loop)** — planner-friendly 回傳(`loop`:`state` / `available_actions` / `recommended_next_actions` / `failure_reason`)· idempotent 步驟 verify + 有限自動重試(`max_action_retries`,預設 1、上限 2;每個 loop attempt 一次 HTTP attempt;高風險 action 永不自動重試)· 操作紀錄 `operation_log`。Browser Use 第三步:把 Observe → Act → **Verify** 收成可規劃的迴圈
+- ✅ **v1.4(Chrome Fallback Broker)** — 明確可解釋的 fallback 決策(`challenge` / `js_app` / `no_actions` / `forced`)· session idempotent 步驟自動升級**一次**有界 headless render,rendered DOM 重走同一條蒸餾管線(絕不回 raw DOM/截圖)· 確認後的非 GET 結果頁永不被瀏覽器重抓 · `session_start` 加 `js` / `js_wait`。Browser Use 第四步:RB 解不了 → 才進 Chrome,而且說得出為什麼
 
 ## 技術棧
 

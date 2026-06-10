@@ -9,6 +9,7 @@ pub mod budget;
 pub mod cache;
 pub mod convert;
 pub mod extract;
+pub mod fallback;
 pub mod fetch;
 pub mod planner;
 pub mod render;

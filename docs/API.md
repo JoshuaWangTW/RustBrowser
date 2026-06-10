@@ -108,7 +108,7 @@ the session view as JSON. The view's 1.x fields
 it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 (both additive):
 
-- `loop.state` — `{url?, status, title, excerpt?, content_chars, action_count, low_content, used_headless, steps_taken}`.
+- `loop.state` — `{url?, status, title, excerpt?, content_chars, action_count, low_content, used_headless, steps_taken, fallback_reason?}`. `fallback_reason` (since 1.4) says why the Chrome Fallback Broker escalated the last step (`challenge`, `js_app`, `no_actions`, `forced`); absent = RB-only extraction was enough.
 - `loop.available_actions` — array of `{action_id, kind, label, target?, method?, dangerous?, fields?}` (links/forms/buttons/downloads flattened). For forms, `fields` lists caller-fillable names only; hidden/default fields are still carried internally when submitting.
 - `loop.recommended_next_actions` — array of `{action_id, kind, why}` (heuristic hints, never auto-executed).
 - `loop.failure_reason` — string, present only when the last step failed verification (an HTTP error status).
@@ -118,7 +118,7 @@ it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 
 | Tool | Params | Notes |
 |---|---|---|
-| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries` | Opens `url`, returns a `session_id` + first snapshot + `loop`. |
+| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries`, `js` (`off`/`auto`/`always`, default `auto`), `js_wait` (ms) | Opens `url`, returns a `session_id` + first snapshot + `loop`. |
 | `session_observe` | `session_id`, `url` | Navigate the session to `url` (keeps cookies). |
 | `session_follow` | `session_id`, `action_id` | Follow a `link_*`/`download_*` from the last snapshot. |
 | `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns the session view plus `{needs_confirmation, would_submit}`). |

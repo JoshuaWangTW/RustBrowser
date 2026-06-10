@@ -441,3 +441,110 @@ async fn loop_view_exposes_state_actions_and_recommendation() {
         "search form should be recommended"
     );
 }
+
+/// An unrendered SPA shell: framework root div + scripts, no extractable text.
+const SPA: &str = r#"<!DOCTYPE html><html><head><title>App</title>
+  <script src="/bundle.js"></script><script>window.boot=1</script></head>
+  <body><div id="root"></div></body></html>"#;
+
+async fn spa(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/app"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(SPA),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn js_off_never_escalates_to_chrome() {
+    let server = MockServer::start().await;
+    spa(&server).await;
+
+    let mut s = Session::new(DistillOptions {
+        js_mode: rustbrowser::JsMode::Off,
+        ..opts()
+    })
+    .unwrap();
+    s.observe(&format!("{}/app", server.uri())).await.unwrap();
+
+    let view = s.loop_view();
+    assert_eq!(view.state.fallback_reason, None, "Off must never escalate");
+    assert!(!view.state.used_headless);
+    assert!(
+        !s.log().iter().any(|e| e.outcome.starts_with("chrome_")),
+        "no fallback log entries under js=off"
+    );
+}
+
+#[tokio::test]
+async fn auto_mode_engages_fallback_broker_on_spa() {
+    let server = MockServer::start().await;
+    spa(&server).await;
+
+    // Short render budget keeps the test snappy; the assertions hold whether or
+    // not a local Chrome/Edge is installed (a missing browser logs
+    // `chrome_fallback_failed` and the HTTP snapshot stands).
+    let mut s = Session::new(DistillOptions {
+        js_wait: Some(1500),
+        ..opts()
+    })
+    .unwrap();
+    s.observe(&format!("{}/app", server.uri())).await.unwrap();
+
+    let view = s.loop_view();
+    assert_eq!(
+        view.state.fallback_reason.as_deref(),
+        Some("js_app"),
+        "broker must classify the SPA shell"
+    );
+    assert!(
+        s.log()
+            .iter()
+            .any(|e| e.outcome.starts_with("chrome_fallback")),
+        "broker must attempt exactly one escalation (log: {:?})",
+        s.log()
+            .iter()
+            .map(|e| e.outcome.as_str())
+            .collect::<Vec<_>>()
+    );
+    // Still one settled navigation; the escalation is part of the same step.
+    assert_eq!(s.redirect_history().len(), 1);
+    assert_eq!(view.state.steps_taken, 1);
+}
+
+#[tokio::test]
+async fn confirmed_post_result_is_never_re_rendered() {
+    let server = MockServer::start().await;
+    home(&server).await;
+    // The POST lands on a script-heavy thin page — exactly what would trigger
+    // the broker — but a POST result must never be re-fetched by a browser.
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(SPA),
+        )
+        .mount(&server)
+        .await;
+
+    let mut s = Session::new(opts()).unwrap();
+    s.observe(&format!("{}/", server.uri())).await.unwrap();
+    let values = [("user".to_string(), "alice".to_string())];
+    let done = s.submit_form("form_1", &values, true).await.unwrap();
+    assert!(matches!(done, SubmitOutcome::Submitted));
+
+    assert_eq!(
+        s.loop_view().state.fallback_reason,
+        None,
+        "POST results must never escalate to Chrome"
+    );
+    assert!(
+        !s.log().iter().any(|e| e.outcome.starts_with("chrome_")),
+        "no fallback attempt for a confirmed POST"
+    );
+}

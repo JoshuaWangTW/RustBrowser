@@ -346,6 +346,16 @@ struct SessionStartParams {
     /// 0–2 (default 1). Non-GET submits are NEVER auto-retried.
     #[serde(default)]
     max_action_retries: Option<usize>,
+    /// Chrome Fallback Broker policy: "off", "auto" (default — escalate one
+    /// bounded headless render only when RB-only extraction looks insufficient:
+    /// unrendered JS app, anti-bot challenge, or a script-built action surface),
+    /// or "always". The rendered DOM is re-distilled; the session's cookies are
+    /// NOT carried into the fallback browser.
+    #[serde(default)]
+    js: Option<String>,
+    /// Headless wait / virtual-time budget in milliseconds for fallback renders.
+    #[serde(default)]
+    js_wait: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -395,6 +405,8 @@ fn session_opts(p: &SessionStartParams) -> DistillOptions {
         max_actions: p.max_actions,
         allow_local: p.allow_local.unwrap_or(false),
         respect_robots: p.respect_robots.unwrap_or(false),
+        js_mode: parse_js_mode(p.js.as_deref()),
+        js_wait: p.js_wait,
         extract_actions: true,
         diagnostics: true,
         use_cache: false,
@@ -810,9 +822,12 @@ impl ServerHandler for RustBrowserServer {
              reply includes a planner-friendly `loop` view (state, available_actions, \
              recommended_next_actions, failure_reason) and a debug `operation_log`; idempotent \
              steps are verified and retried up to max_action_retries on a transient failure, while \
-             dangerous (non-GET) submits are never auto-executed or retried. Use session_close to \
-             forget cookies and release the session. All return clean output instead of raw HTML, \
-             saving 75-98% of tokens.",
+             dangerous (non-GET) submits are never auto-executed or retried. When RB-only \
+             extraction is not enough (unrendered JS app, anti-bot challenge, script-built \
+             actions), the Chrome Fallback Broker escalates ONE bounded headless render and \
+             re-distills it — `loop.state.fallback_reason` says why; control it with the `js` \
+             session param (off/auto/always). Use session_close to forget cookies and release \
+             the session. All return clean output instead of raw HTML, saving 75-98% of tokens.",
         )
     }
 }
@@ -1014,6 +1029,8 @@ mod tests {
             "allow_local",
             "respect_robots",
             "max_action_retries",
+            "js",
+            "js_wait",
         ] {
             assert!(
                 start.contains(key),

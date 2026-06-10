@@ -1,11 +1,19 @@
 name: Release
 
 # Push a tag like v0.5.0 to build cross-platform binaries and attach them to a
-# GitHub Release automatically.
+# GitHub Release automatically. Can also be dispatched manually with an existing
+# tag to (re)build and backfill that release's assets — e.g. after a flaky
+# upload left a platform missing.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and upload assets for"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -42,6 +50,9 @@ jobs:
             archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On manual dispatch, build the requested tag, not the default branch.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,8 +93,25 @@ jobs:
           fi
           cat "$f.sha256"
 
+      # Upload via the preinstalled gh CLI with retries. The previous
+      # action-gh-release attach step flaked on transient GitHub API 401s
+      # (v1.3.0 needed manual reruns); `gh release upload --clobber` is
+      # idempotent, so retrying is always safe.
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: rustbrowser-${{ matrix.target }}.*
-          generate_release_notes: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # Ensure the release exists; one job wins the create, the rest reuse it.
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --generate-notes \
+            || true
+          for i in 1 2 3; do
+            if gh release upload "$TAG" rustbrowser-${{ matrix.target }}.* --clobber; then
+              exit 0
+            fi
+            echo "upload attempt $i failed; retrying in $((i * 20))s"
+            sleep $((i * 20))
+          done
+          exit 1

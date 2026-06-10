@@ -137,6 +137,16 @@ forms. The relevant safeguards:
 - **Cookies are in-memory and per-session** — they live only for the life of the
   session object and are not written to disk. `session_close` explicitly
   forgets a session, and the MCP server caps the number of live sessions.
+- **Chrome fallback is bounded and idempotent-only (v1.4)** — the Fallback
+  Broker escalates at most ONE headless render per settled step, only for
+  `observe`/`follow`/GET submits, and only for an explicit reason
+  (`challenge`/`js_app`/`no_actions`/`forced`). A confirmed non-GET submit's
+  result page is never re-fetched by a browser. The render reuses the hardened
+  headless path (sandbox ON by default, streamed DOM cap) and re-distills the
+  DOM — raw DOM never reaches the caller. The session's cookie jar is **not**
+  shared with the fallback browser process, so session credentials never leave
+  RB's HTTP client; the trade-off is that login-gated pages may render
+  differently in the fallback (visible via `fallback_reason` + `used_headless`).
 
 ## Hardening checklist for operators
 

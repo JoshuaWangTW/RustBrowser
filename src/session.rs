@@ -14,15 +14,24 @@
 //! a *dangerous* action: it is refused unless the caller confirms, and is **never
 //! retried** — RB never silently re-sends a POST.
 //!
+//! Fallback: when RB-only extraction looks insufficient (unrendered JS app,
+//! anti-bot challenge, action surface built client-side), the Chrome Fallback
+//! Broker escalates ONE bounded headless render and re-distills it through the
+//! same token-lean pipeline — see [`crate::fallback`]. Only idempotent steps
+//! escalate; a confirmed non-GET submit's result page is never re-fetched.
+//!
 //! Safety: every request reuses the same SSRF-screened path as plain fetches.
+
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::time::sleep;
 
 use crate::actions::FormAction;
+use crate::fallback::{self, FallbackReason};
 use crate::fetch::{self, FetchOptions, FetchResult, Fetcher, SubmitMethod};
 use crate::planner::{self, LoopView, OpLogEntry};
-use crate::{DistillOptions, Distilled, distill_html};
+use crate::{DistillOptions, Distilled, JsMode, distill_html, render};
 
 /// Default extra attempts for an idempotent step whose verify failed.
 const DEFAULT_MAX_ACTION_RETRIES: usize = 1;
@@ -50,6 +59,9 @@ pub struct Session {
     /// Logical operation counter: one per observe/follow/submit_form call.
     /// Every log entry an operation produces (retries included) shares it.
     step: usize,
+    /// Why the Chrome Fallback Broker escalated the last settled step
+    /// (`None` = RB-only extraction was enough).
+    last_fallback: Option<String>,
 }
 
 /// What happened when a form submit was requested.
@@ -105,6 +117,7 @@ impl Session {
             last_failure: None,
             log: Vec::new(),
             step: 0,
+            last_fallback: None,
         })
     }
 
@@ -132,6 +145,12 @@ impl Session {
         self.last_failure.as_deref()
     }
 
+    /// Why the Chrome Fallback Broker escalated the last settled step
+    /// (`challenge`, `js_app`, `no_actions`, `forced`); `None` = no escalation.
+    pub fn last_fallback(&self) -> Option<&str> {
+        self.last_fallback.as_deref()
+    }
+
     /// The full operation log.
     pub fn log(&self) -> &[OpLogEntry] {
         &self.log
@@ -146,11 +165,13 @@ impl Session {
     /// A compact, planner-friendly view of the current state, available actions,
     /// recommended next actions, and any failure reason.
     pub fn loop_view(&self) -> LoopView {
-        planner::loop_view(
+        let mut view = planner::loop_view(
             self.last_snapshot.as_ref(),
             self.last_failure.clone(),
             self.step,
-        )
+        );
+        view.state.fallback_reason = self.last_fallback.clone();
+        view
     }
 
     /// Fetch `url` and make it the current snapshot (idempotent: verified +
@@ -226,7 +247,8 @@ impl Session {
                 return Err(e);
             }
         };
-        self.settle("submit_form", &form.action, 1, result)?;
+        self.settle("submit_form", &form.action, 1, result, false)
+            .await?;
         Ok(SubmitOutcome::Submitted)
     }
 
@@ -258,8 +280,8 @@ impl Session {
                         attempt += 1;
                         continue;
                     }
-                    // Keep this result.
-                    self.settle(op, &target, attempt + 1, result)?;
+                    // Keep this result (idempotent step: the broker may escalate).
+                    self.settle(op, &target, attempt + 1, result, true).await?;
                     return self.snapshot_ref();
                 }
                 Err(e) => {
@@ -290,30 +312,93 @@ impl Session {
     }
 
     /// Keep a settled fetch result: distill it into the snapshot (atomic — a
-    /// distill failure leaves prior state intact), verify it, commit the
-    /// navigation to history, and log the outcome. Shared by the idempotent
-    /// retry loop and the single-attempt confirmed non-GET submit.
-    fn settle(
+    /// distill failure leaves prior state intact), let the Chrome Fallback
+    /// Broker escalate once when RB-only extraction looks insufficient, verify,
+    /// commit the navigation to history, and log the outcome. Shared by the
+    /// idempotent retry loop and the single-attempt confirmed non-GET submit —
+    /// the latter passes `allow_fallback = false`, because a POST's result page
+    /// must never be re-fetched by a browser.
+    async fn settle(
         &mut self,
         op: &str,
         target: &str,
         attempt: usize,
         result: FetchResult,
+        allow_fallback: bool,
     ) -> Result<()> {
         let status = result.status;
-        if let Err(e) = self.record(result) {
-            self.log_attempt(
-                op,
-                target,
-                Some(status),
-                attempt,
-                "distill_failed",
-                Some(short_err(&e)),
-            );
-            return Err(e);
+        let mut snap = match self.distill_result(&result) {
+            Ok(s) => s,
+            Err(e) => {
+                self.log_attempt(
+                    op,
+                    target,
+                    Some(status),
+                    attempt,
+                    "distill_failed",
+                    Some(short_err(&e)),
+                );
+                return Err(e);
+            }
+        };
+
+        // Chrome Fallback Broker (Observe → Act → Verify → **Fallback**): one
+        // bounded headless render when RB alone is not enough; the rendered DOM
+        // is re-distilled through the same token-lean pipeline, so the caller
+        // still gets compressed content + action tree — never a raw DOM. A
+        // failed render is non-fatal: the HTTP snapshot stands.
+        self.last_fallback = None;
+        if allow_fallback && let Some(reason) = self.fallback_decision(&snap, &result.html) {
+            self.last_fallback = Some(reason.label().to_string());
+            match self.render_fallback(&result.final_url).await {
+                Ok(rendered) => {
+                    let rendered_result = FetchResult {
+                        final_url: result.final_url.clone(),
+                        status,
+                        content_type: result.content_type.clone(),
+                        raw_bytes: rendered.len(),
+                        html: rendered,
+                    };
+                    match self.distill_result(&rendered_result) {
+                        Ok(mut rendered_snap) => {
+                            if let Some(d) = rendered_snap.diagnostics.as_mut() {
+                                d.used_headless = true;
+                            }
+                            snap = rendered_snap;
+                            self.log_attempt(
+                                op,
+                                target,
+                                Some(status),
+                                attempt,
+                                "chrome_fallback",
+                                Some(reason.label().to_string()),
+                            );
+                        }
+                        Err(e) => self.log_attempt(
+                            op,
+                            target,
+                            Some(status),
+                            attempt,
+                            "chrome_fallback_failed",
+                            Some(short_err(&e)),
+                        ),
+                    }
+                }
+                Err(e) => self.log_attempt(
+                    op,
+                    target,
+                    Some(status),
+                    attempt,
+                    "chrome_fallback_failed",
+                    Some(short_err(&e)),
+                ),
+            }
         }
-        let failure = self.last_snapshot.as_ref().and_then(planner::verify);
+
+        let failure = planner::verify(&snap);
         self.last_failure = failure.clone();
+        self.current_url = Some(result.final_url);
+        self.last_snapshot = Some(snap);
         self.commit_navigation();
         self.log_attempt(
             op,
@@ -326,19 +411,37 @@ impl Session {
         Ok(())
     }
 
-    /// Distill `result` into the current snapshot. Atomic: distills first, then
-    /// mutates, so a distill failure leaves the previous snapshot/URL intact.
-    /// Does **not** touch `redirect_history` — that is committed once per settled
-    /// navigation by [`Session::commit_navigation`].
-    fn record(&mut self, result: FetchResult) -> Result<()> {
+    /// Distill a fetch result into a snapshot. Pure with respect to session
+    /// state — nothing is mutated here, so a distill failure leaves the
+    /// previous snapshot/URL/history intact.
+    fn distill_result(&self, result: &FetchResult) -> Result<Distilled> {
         let mut snap = distill_html(&result.html, &result.final_url, &self.opts)
             .with_context(|| format!("distilling session snapshot for {}", result.final_url))?;
         // distill_html stamps a synthetic 200; carry the real HTTP status.
         snap.status = result.status;
+        Ok(snap)
+    }
 
-        self.current_url = Some(result.final_url);
-        self.last_snapshot = Some(snap);
-        Ok(())
+    /// The broker's policy gate: `Off` never escalates, `Always` forces one
+    /// render per settled step, `Auto` asks [`fallback::assess`].
+    fn fallback_decision(&self, snap: &Distilled, raw_html: &str) -> Option<FallbackReason> {
+        match self.opts.js_mode {
+            JsMode::Off => None,
+            JsMode::Always => Some(FallbackReason::Forced),
+            JsMode::Auto => fallback::assess(snap, raw_html),
+        }
+    }
+
+    /// One bounded headless render of `url`. The render is a separate browser
+    /// process: the session's cookie jar is NOT carried into it (see
+    /// SECURITY.md), so a page behind a session login may render differently.
+    async fn render_fallback(&self, url: &str) -> Result<String> {
+        let budget = self
+            .opts
+            .js_wait
+            .map(Duration::from_millis)
+            .unwrap_or(self.opts.timeout);
+        render::render_html(url, budget).await
     }
 
     /// Record the settled current URL in the redirect history (one entry per
