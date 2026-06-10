@@ -52,6 +52,11 @@ pub struct PageState {
     /// How many operations (observe / follow / submit_form) the session has
     /// run so far. Retry attempts within an operation do not add steps.
     pub steps_taken: usize,
+    /// Why the Chrome Fallback Broker escalated the last settled step
+    /// (`challenge`, `js_app`, `no_actions`, `forced`); `None` = RB-only
+    /// extraction was enough. See [`crate::fallback`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 impl PageState {
@@ -66,6 +71,7 @@ impl PageState {
             low_content: false,
             used_headless: false,
             steps_taken,
+            fallback_reason: None,
         }
     }
 }
@@ -118,7 +124,8 @@ pub struct OpLogEntry {
     /// non-GET submit withheld pending confirmation).
     pub attempt: usize,
     /// `ok`, `verify_failed`, `retryable_status`, `transient_error_retry`,
-    /// `error`, `distill_failed`, or `needs_confirmation`.
+    /// `error`, `distill_failed`, `needs_confirmation`, `chrome_fallback`, or
+    /// `chrome_fallback_failed`.
     pub outcome: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
@@ -168,6 +175,9 @@ pub fn loop_view(
             low_content: diag.is_some_and(|d| d.low_content),
             used_headless: diag.is_some_and(|d| d.used_headless),
             steps_taken,
+            // The broker's reason lives on the Session; Session::loop_view
+            // patches it in after building this view.
+            fallback_reason: None,
         },
         available_actions,
         recommended_next_actions,

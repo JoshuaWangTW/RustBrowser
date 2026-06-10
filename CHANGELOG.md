@@ -5,6 +5,42 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.4.0]
+
+Fourth Browser-Use step: the **Chrome Fallback Broker** — RB stays first, and
+escalation to a real browser is explicit, bounded, and explainable.
+
+### Added
+- **`rustbrowser::fallback`** — pure, explainable fallback decisions. A settled
+  session step escalates only for an explicit `FallbackReason`: `challenge`
+  (anti-bot/captcha interstitial markers), `js_app` (unrendered client-side
+  app / canvas / shadow-DOM shell with thin extracted content), `no_actions`
+  (action extraction found nothing operable on a script-heavy page), or
+  `forced` (`js=always`).
+- **Session Chrome fallback** — when the broker says RB-only extraction is
+  insufficient, the session runs ONE bounded headless render of the settled
+  URL and re-distills it through the same token-lean pipeline. The LLM still
+  receives compressed content + action tree — never a raw DOM or screenshot.
+  A failed render is non-fatal (the HTTP snapshot stands) and is logged as
+  `chrome_fallback_failed`.
+- **`loop.state.fallback_reason`** in the session view and
+  `Session::last_fallback()` in the library; `chrome_fallback` /
+  `chrome_fallback_failed` operation-log outcomes.
+- **`session_start` params `js` (`off`/`auto`/`always`, default `auto`) and
+  `js_wait` (ms)** to control the broker per session.
+
+### Safety
+- Only **idempotent** steps escalate (observe / follow / GET submit). A
+  confirmed non-GET submit's result page is **never** re-fetched by a browser.
+- The fallback render reuses the existing hardened headless path (sandbox ON by
+  default, streamed DOM cap). The session's **cookies are NOT carried** into
+  the fallback browser — a page behind a session login may render differently;
+  the planner can see this via `fallback_reason` + `used_headless`.
+
+### Fixed
+- Release uploads now use `gh release upload --clobber` with retries instead of
+  `action-gh-release` (whose attach step flaked on transient GitHub API 401s).
+
 ## [1.3.0]
 
 Third Browser-Use step: the **Action Loop** — every session reply is now a
