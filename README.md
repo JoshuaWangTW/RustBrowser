@@ -256,7 +256,7 @@ claude mcp add rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowse
 claude mcp add --scope user rustbrowser -- D:\aiproject\RustBrowser\target\release\rustbrowser-mcp.exe
 ```
 
-共同參數:`format`、`selector`、`stats`、`timeout_secs`、`max_bytes`、`no_cache`、`cache_ttl`、`extract_links`、`extract_tables`、`links_full`、`js`(off/auto/always)、`js_wait`、`js_wait_for`、`allow_local`(放行 loopback,預設 false)、`max_retries`(預設 2)、`per_host_concurrency`(預設 4)、`rate_limit`(每秒次數,預設 0=不限)、`respect_robots`(預設 false)、`profile`(article/full/metadata)、`max_output_tokens`、`diagnostics`(預設 false);`fetch_urls` 另有 `urls` 與 `concurrency`。
+共同參數:`format`、`selector`、`stats`、`timeout_secs`、`max_bytes`、`no_cache`、`cache_ttl`、`extract_links`、`extract_tables`、`links_full`、`js`(off/auto/always)、`js_wait`、`js_wait_for`、`allow_local`(放行 loopback,預設 false)、`max_retries`(預設 2)、`per_host_concurrency`(預設 4)、`rate_limit`(每秒次數,預設 0=不限)、`respect_robots`(預設 false)、`profile`(article/full/metadata)、`max_output_tokens`(預設 20000,0=不限)、`diagnostics`(預設 false);`fetch_urls` 另有 `urls` 與 `concurrency`。
 
 ## 從原始碼編譯
 

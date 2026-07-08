@@ -229,7 +229,8 @@ struct FetchParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default:
+    /// 20000; pass 0 for unlimited).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to the result (default false).
@@ -307,7 +308,8 @@ struct FetchManyParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default:
+    /// 20000; pass 0 for unlimited).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to each result (default false).
@@ -430,6 +432,24 @@ fn parse_profile(profile: Option<&str>) -> Profile {
     }
 }
 
+/// Default token budget for MCP tool results. The MCP consumer is always an
+/// LLM client with its own tool-result cap (Claude Code's is around 25k
+/// tokens); a fetch left unbounded can blow well past that on a large page.
+/// Leaves some envelope headroom under that cap.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 20_000;
+
+/// Resolve the MCP `max_output_tokens` parameter: unset falls back to the
+/// token-lean default, `0` is the explicit opt-out to remove the cap, and any
+/// other value passes through unchanged. Library/CLI callers are unaffected —
+/// this mapping only applies to the MCP tool layer.
+fn resolve_max_output_tokens(max_output_tokens: Option<usize>) -> Option<usize> {
+    match max_output_tokens {
+        None => Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        Some(0) => None,
+        some => some,
+    }
+}
+
 /// Build pipeline options from optional MCP parameters.
 #[allow(clippy::too_many_arguments)]
 fn opts_from(
@@ -477,7 +497,7 @@ fn opts_from(
         min_request_interval: rate_to_interval(rate_limit.unwrap_or(0.0)),
         respect_robots: respect_robots.unwrap_or(false),
         profile: parse_profile(profile),
-        max_output_tokens,
+        max_output_tokens: resolve_max_output_tokens(max_output_tokens),
         diagnostics: diagnostics.unwrap_or(false),
         extract_actions: extract_actions.unwrap_or(false),
         max_actions,
@@ -931,6 +951,19 @@ mod tests {
         assert!(value.get("loop").is_some());
         assert!(value.get("operation_log").is_some());
         assert!(value.get("snapshot").is_some());
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_applies_default_and_opt_out() {
+        // Unset: falls back to the token-lean default.
+        assert_eq!(
+            resolve_max_output_tokens(None),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS)
+        );
+        // Explicit 0: the opt-out to remove the cap entirely.
+        assert_eq!(resolve_max_output_tokens(Some(0)), None);
+        // Any other explicit value passes through unchanged.
+        assert_eq!(resolve_max_output_tokens(Some(500)), Some(500));
     }
 
     /// Property names present in a generated JSON schema's `properties` object.
