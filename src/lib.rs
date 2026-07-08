@@ -351,7 +351,11 @@ impl BrowserCore {
 
         let fetched = self.fetcher.fetch(url).await?;
 
-        if opts.use_cache {
+        // Retryable statuses (429/5xx) are transient — caching one would keep
+        // serving it for the whole `cache_ttl` window even after the upstream
+        // has recovered. Stable responses (2xx/3xx/4xx, including 404) still
+        // cache as before.
+        if opts.use_cache && !fetch::is_retryable_status(fetched.status) {
             let _ = cache::put(
                 url,
                 &CachedFetch {

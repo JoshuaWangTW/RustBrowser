@@ -373,6 +373,64 @@ async fn surfaces_final_status_after_exhausting_retries() {
 }
 
 #[tokio::test]
+async fn transient_5xx_response_is_not_cached() {
+    let server = MockServer::start().await;
+    // Route unique to this run: a stale on-disk cache entry from a previous
+    // run reusing the same ephemeral port could otherwise be mistaken for a
+    // fresh hit, since the cache key is derived from the URL alone.
+    let route = format!(
+        "/flaky-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    // First hit → 503 (served at most once); after it is spent, 200 takes over.
+    Mock::given(method("GET"))
+        .and(path(route.as_str()))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string("<html><body><p>temporarily down</p></body></html>"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(route.as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/html")
+                .set_body_string(ARTICLE),
+        )
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let url = format!("{}{route}", server.uri());
+    let opts = DistillOptions {
+        use_cache: true,
+        max_retries: 0, // isolate: exactly one HTTP hit per `distill` call
+        ..local_opts()
+    };
+
+    let first = distill(&url, &opts).await.expect("first fetch succeeds");
+    assert_eq!(first.status, 503, "first fetch should observe the 503");
+
+    // If the 503 had been cached, this second call would be served the stale
+    // cache entry without ever reaching the network — the 200 mock (now the
+    // only route left, since the 503 mock's one-time allowance is spent)
+    // would never be hit.
+    let second = distill(&url, &opts).await.expect("second fetch succeeds");
+    assert_eq!(
+        second.status, 200,
+        "503 must not be cached: second fetch should reach the network and see 200, got {}",
+        second.status
+    );
+}
+
+#[tokio::test]
 async fn robots_txt_blocks_only_when_respected() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
