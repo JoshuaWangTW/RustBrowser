@@ -241,6 +241,20 @@ pub async fn render_html(_url: &str, _wait: Duration) -> Result<String> {
 #[cfg(feature = "js")]
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Removes the Chrome `--user-data-dir` temp directory on drop, so cleanup
+/// still runs if `render_html_cdp`'s future is cancelled or panics before
+/// reaching its normal teardown path (a plain end-of-function cleanup call
+/// would miss both cases).
+#[cfg(feature = "js")]
+struct TempDirGuard(std::path::PathBuf);
+
+#[cfg(feature = "js")]
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Render `url` over the Chrome DevTools Protocol, waiting until `wait_for` (a
 /// CSS selector) appears in the DOM before capturing it. If the selector never
 /// shows up within `budget`, we capture whatever is present. Heavier than
@@ -257,6 +271,9 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
     let user_dir =
         std::env::temp_dir().join(format!("rustbrowser-cdp-{}-{uniq}", std::process::id()));
     let _ = std::fs::create_dir_all(&user_dir);
+    // Guarantees the temp dir is removed even on early return, cancellation,
+    // or panic — a plain call at the end of this function would miss all three.
+    let _guard = TempDirGuard(user_dir.clone());
 
     let mut args = base_headless_args();
     args.push("--remote-debugging-port=0".into());
@@ -267,13 +284,26 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
         .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .context("launching headless Chrome for CDP")?;
 
-    // Always tear the browser and temp dir down, even on error.
-    let outcome = cdp_session(url, wait_for, budget, &user_dir).await;
+    // Bound the whole session so a Chrome that connects but never responds
+    // can't hang this future forever. The +15s margin mirrors render_html's
+    // `wait + 15s` timeout convention. A failure here is non-fatal: the
+    // caller falls back to the plain HTTP snapshot.
+    let outcome = match timeout(
+        budget + Duration::from_secs(15),
+        cdp_session(url, wait_for, budget, &user_dir),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("CDP render timed out")),
+    };
+    // Always tear the browser down; `kill_on_drop` is the backstop if this
+    // future itself gets cancelled before reaching this line.
     let _ = child.kill().await;
-    let _ = std::fs::remove_dir_all(&user_dir);
     outcome
 }
 
@@ -498,5 +528,26 @@ mod tests {
         assert!(capped.len() <= MAX_RENDER_BYTES);
         // If it compiled to a String it is valid UTF-8; round-trip to be sure.
         assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn temp_dir_guard_removes_dir_on_drop() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rustbrowser-test-guard-{}-{uniq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(dir.exists());
+
+        {
+            let _guard = TempDirGuard(dir.clone());
+        } // guard drops here, removing the directory
+
+        assert!(!dir.exists());
     }
 }

@@ -64,7 +64,7 @@ session tools.
 | `profile` | string (`article`/`full`/`metadata`) | `article` |
 | `stats` | bool | `false` |
 | `diagnostics` | bool | `false` |
-| `max_output_tokens` | integer | — |
+| `max_output_tokens` | integer | `20000` (`0` = unlimited) |
 | `timeout_secs` | integer | `20` |
 | `max_bytes` | integer | `8388608` |
 | `no_cache` | bool | `false` |

@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "rustbrowser"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1914,6 +1914,7 @@ dependencies = [
  "flate2",
  "futures",
  "htmd",
+ "httpdate",
  "reqwest",
  "rmcp",
  "schemars",

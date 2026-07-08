@@ -229,7 +229,8 @@ struct FetchParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default:
+    /// 20000; pass 0 for unlimited).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to the result (default false).
@@ -307,7 +308,8 @@ struct FetchManyParams {
     /// Content profile: "article" (default), "full" (whole body), or "metadata".
     #[serde(default)]
     profile: Option<String>,
-    /// Truncate the Markdown/text output to fit this many tokens (default: no limit).
+    /// Truncate the Markdown/text output to fit this many tokens (default:
+    /// 20000; pass 0 for unlimited).
     #[serde(default)]
     max_output_tokens: Option<usize>,
     /// Attach extraction-quality diagnostics to each result (default false).
@@ -430,6 +432,61 @@ fn parse_profile(profile: Option<&str>) -> Profile {
     }
 }
 
+/// Default token budget for MCP tool results. The MCP consumer is always an
+/// LLM client with its own tool-result cap (Claude Code's is around 25k
+/// tokens); a fetch left unbounded can blow well past that on a large page.
+/// Leaves some envelope headroom under that cap.
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 20_000;
+
+/// Resolve the MCP `max_output_tokens` parameter: unset falls back to the
+/// token-lean default, `0` is the explicit opt-out to remove the cap, and any
+/// other value passes through unchanged. Library/CLI callers are unaffected —
+/// this mapping only applies to the MCP tool layer.
+fn resolve_max_output_tokens(max_output_tokens: Option<usize>) -> Option<usize> {
+    match max_output_tokens {
+        None => Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        Some(0) => None,
+        some => some,
+    }
+}
+
+/// Margin added on top of the worst-case fetch/render time, mirroring the
+/// `wait + 15s` convention `render.rs` already uses for Chrome startup and DOM
+/// capture — this covers the same slack plus synchronous extraction.
+const HANDLER_BUDGET_MARGIN: Duration = Duration::from_secs(15);
+
+/// Wall-clock deadline this MCP layer enforces around a fetch/observe call.
+///
+/// Nothing between the MCP handler and the pipeline previously bounded the
+/// *whole* call: `timeout_secs` only constrains a single HTTP attempt inside
+/// `opts.timeout`, not the retry loop stacked on top of it, and headless
+/// rendering has its own internal deadline that this layer never watched
+/// either. A stalled attempt that keeps retrying (or a render that hangs past
+/// its own deadline) could leave the client waiting long enough to give up
+/// and report "transport closed" (see RB_FETCH_ISSUES.md). This budget is the
+/// deadline this layer enforces instead of waiting unbounded:
+/// `(max_retries + 1)` HTTP attempts at `timeout_secs` each — the worst case
+/// if every attempt stalls and gets retried — maxed with the headless render
+/// wait, plus `HANDLER_BUDGET_MARGIN`. Backoff/`Retry-After` delays between
+/// attempts are not separately accounted for; they are small next to the
+/// margin under normal (non-adversarial) server behaviour.
+///
+/// Saturating arithmetic throughout: an MCP client could in principle send an
+/// absurd `max_retries`/`timeout_secs`, and this must not panic.
+fn handler_budget(
+    timeout_secs: Option<u64>,
+    max_retries: Option<usize>,
+    js_wait: Option<u64>,
+) -> Duration {
+    let per_attempt = timeout_secs.unwrap_or(20);
+    let attempts = (max_retries.unwrap_or(2) as u64).saturating_add(1);
+    let fetch_worst_case = Duration::from_secs(per_attempt.saturating_mul(attempts));
+    let render_wait = js_wait.map(Duration::from_millis).unwrap_or_default();
+    fetch_worst_case
+        .max(render_wait)
+        .saturating_add(HANDLER_BUDGET_MARGIN)
+}
+
 /// Build pipeline options from optional MCP parameters.
 #[allow(clippy::too_many_arguments)]
 fn opts_from(
@@ -477,7 +534,7 @@ fn opts_from(
         min_request_interval: rate_to_interval(rate_limit.unwrap_or(0.0)),
         respect_robots: respect_robots.unwrap_or(false),
         profile: parse_profile(profile),
-        max_output_tokens,
+        max_output_tokens: resolve_max_output_tokens(max_output_tokens),
         diagnostics: diagnostics.unwrap_or(false),
         extract_actions: extract_actions.unwrap_or(false),
         max_actions,
@@ -605,9 +662,18 @@ impl RustBrowserServer {
             p.extract_actions,
             p.max_actions,
         );
-        let result = distill(&p.url, &opts)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("fetch failed: {e}"), None))?;
+        let budget = handler_budget(p.timeout_secs, p.max_retries, p.js_wait);
+        let result = match tokio::time::timeout(budget, distill(&p.url, &opts)).await {
+            Ok(r) => {
+                r.map_err(|e| rmcp::ErrorData::internal_error(format!("fetch failed: {e}"), None))?
+            }
+            Err(_) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("fetch exceeded time budget of {}s", budget.as_secs()),
+                    None,
+                ));
+            }
+        };
         let fmt = p.format.as_deref().unwrap_or("markdown");
         render(&result, fmt)
     }
@@ -646,9 +712,18 @@ impl RustBrowserServer {
         // Observe always surfaces the action tree (and diagnostics), as JSON.
         opts.extract_actions = true;
         opts.diagnostics = true;
-        let result = distill(&p.url, &opts)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None))?;
+        let budget = handler_budget(p.timeout_secs, p.max_retries, p.js_wait);
+        let result = match tokio::time::timeout(budget, distill(&p.url, &opts)).await {
+            Ok(r) => r.map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None)
+            })?,
+            Err(_) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!("observe exceeded time budget of {}s", budget.as_secs()),
+                    None,
+                ));
+            }
+        };
         render(&result, "json")
     }
 
@@ -683,7 +758,28 @@ impl RustBrowserServer {
             p.extract_actions,
             p.max_actions,
         );
-        let results = distill_many(&p.urls, &opts, p.concurrency.unwrap_or(8)).await;
+        // distill_many runs `concurrency` fetches at a time, so the batch's
+        // worst case is roughly `ceil(urls / concurrency)` sequential rounds
+        // of the same per-URL budget — a hung URL in one round must not be
+        // allowed to block the whole call indefinitely.
+        let concurrency = p.concurrency.unwrap_or(8).max(1);
+        let rounds = p.urls.len().div_ceil(concurrency).max(1);
+        let budget =
+            handler_budget(p.timeout_secs, p.max_retries, p.js_wait).saturating_mul(rounds as u32);
+        let results =
+            match tokio::time::timeout(budget, distill_many(&p.urls, &opts, concurrency)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Err(rmcp::ErrorData::internal_error(
+                        format!(
+                            "fetch_urls exceeded time budget of {}s for {} URL(s)",
+                            budget.as_secs(),
+                            p.urls.len()
+                        ),
+                        None,
+                    ));
+                }
+            };
         let fmt = p.format.as_deref().unwrap_or("markdown");
 
         if fmt == "json" {
@@ -931,6 +1027,137 @@ mod tests {
         assert!(value.get("loop").is_some());
         assert!(value.get("operation_log").is_some());
         assert!(value.get("snapshot").is_some());
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_applies_default_and_opt_out() {
+        // Unset: falls back to the token-lean default.
+        assert_eq!(
+            resolve_max_output_tokens(None),
+            Some(DEFAULT_MAX_OUTPUT_TOKENS)
+        );
+        // Explicit 0: the opt-out to remove the cap entirely.
+        assert_eq!(resolve_max_output_tokens(Some(0)), None);
+        // Any other explicit value passes through unchanged.
+        assert_eq!(resolve_max_output_tokens(Some(500)), Some(500));
+    }
+
+    #[test]
+    fn handler_budget_defaults_to_retry_multiplied_timeout_plus_margin() {
+        // Defaults: timeout=20s, max_retries=2 → 3 possible HTTP attempts.
+        assert_eq!(
+            handler_budget(None, None, None),
+            Duration::from_secs(3 * 20 + 15)
+        );
+    }
+
+    #[test]
+    fn handler_budget_accounts_for_retry_attempts_not_just_one_timeout() {
+        // A single retry doubles the attempts, hence the worst-case fetch time.
+        assert_eq!(
+            handler_budget(Some(5), Some(1), None),
+            Duration::from_secs(2 * 5 + 15)
+        );
+        assert_eq!(
+            handler_budget(Some(5), Some(0), None),
+            Duration::from_secs(5 + 15)
+        );
+    }
+
+    #[test]
+    fn handler_budget_is_dominated_by_a_larger_render_wait() {
+        // js_wait (30s) exceeds the fetch worst case (1 attempt * 5s), so the
+        // render wait — not the fetch time — sets the floor before the margin.
+        assert_eq!(
+            handler_budget(Some(5), Some(0), Some(30_000)),
+            Duration::from_secs(30 + 15)
+        );
+        // The reverse: fetch worst case dominates a tiny render wait.
+        assert_eq!(
+            handler_budget(Some(5), Some(0), Some(100)),
+            Duration::from_secs(5 + 15)
+        );
+    }
+
+    #[test]
+    fn handler_budget_never_panics_on_pathological_input() {
+        // An adversarial/misconfigured MCP client could send extreme values;
+        // the saturating arithmetic must clamp instead of overflowing.
+        let budget = handler_budget(Some(u64::MAX), Some(usize::MAX), Some(u64::MAX));
+        assert_eq!(budget, Duration::MAX);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_handler_times_out_cleanly_and_server_stays_usable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        // Always 503 with a `Retry-After` far bigger than the handler's own
+        // budget. The retry loop's sleep (honouring `Retry-After`) is not
+        // bounded by `timeout_secs` at all, so this legitimately takes far
+        // longer than a small `timeout_secs`/`max_retries` budget allows —
+        // proving the wrapper fires even though nothing inside `distill()`
+        // itself is hanging past its own internal timeout.
+        Mock::given(method("GET"))
+            .and(path("/slow-retry-after"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "20")
+                    .set_body_raw(b"down".to_vec(), "text/plain"),
+            )
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"# ok".to_vec(), "text/markdown"),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = RustBrowserServer::new();
+
+        // timeout_secs=1, max_retries=1 -> handler_budget = (1+1)*1 + 15 = 17s,
+        // well under the 20s the mandated Retry-After would otherwise sleep.
+        let slow_params: FetchParams = serde_json::from_value(json!({
+            "url": format!("{}/slow-retry-after", mock.uri()),
+            "timeout_secs": 1,
+            "max_retries": 1,
+            "allow_local": true,
+            "no_cache": true,
+        }))
+        .expect("valid FetchParams");
+
+        let start = std::time::Instant::now();
+        let err = server
+            .fetch_url(Parameters(slow_params))
+            .await
+            .expect_err("handler must time out rather than wait out the 20s Retry-After");
+        let elapsed = start.elapsed();
+        assert!(
+            err.message.contains("time budget"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "handler did not time out before the natural retry would have completed: {elapsed:?}"
+        );
+
+        // The server must still work for a subsequent call — the dropped,
+        // mid-sleep `distill()` future must not have wedged anything.
+        let ok_params: FetchParams = serde_json::from_value(json!({
+            "url": format!("{}/ok", mock.uri()),
+            "allow_local": true,
+            "no_cache": true,
+        }))
+        .expect("valid FetchParams");
+        let out = server
+            .fetch_url(Parameters(ok_params))
+            .await
+            .expect("server must still serve requests after a prior timeout");
+        assert!(out.contains("ok"), "unexpected output: {out}");
     }
 
     /// Property names present in a generated JSON schema's `properties` object.
