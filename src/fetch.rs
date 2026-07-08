@@ -488,13 +488,27 @@ fn jitter_ms(base_ms: u64) -> u64 {
     nanos % span
 }
 
-/// Parse a `Retry-After` header's delta-seconds form, capped so a hostile or
-/// silly value can't park us for ages. The HTTP-date form is ignored (we fall
-/// back to normal backoff for it).
+/// Parse a `Retry-After` header's delta-seconds or HTTP-date form, capped so a
+/// hostile or silly value can't park us for ages. A date in the past (or the
+/// current instant) retries immediately per RFC 9110. Values that fail to
+/// parse return `None` so the caller falls back to normal backoff.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    let secs = raw.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(secs.min(60)))
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(60)));
+    }
+    let when = httpdate::parse_http_date(raw).ok()?;
+    Some(retry_after_delta(when, std::time::SystemTime::now()))
+}
+
+/// Turn a parsed `Retry-After` instant into a delay relative to `now`: a
+/// future instant becomes a countdown capped at 60 s, a past or current one
+/// is `Duration::ZERO` (retry immediately). Kept separate from parsing so the
+/// capping/flooring math can be tested without depending on the wall clock.
+fn retry_after_delta(when: std::time::SystemTime, now: std::time::SystemTime) -> Duration {
+    when.duration_since(now)
+        .map(|delta| delta.min(Duration::from_secs(60)))
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Validate URL syntax and obvious local targets without DNS. This is used
@@ -901,13 +915,54 @@ mod tests {
         // Absurd values are capped so a server can't park us for ages.
         h.insert(RETRY_AFTER, HeaderValue::from_static("99999"));
         assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(60)));
-        // HTTP-date form is ignored (we fall back to backoff).
+        // A far-future HTTP-date is parsed too, and capped the same way.
         h.insert(
             RETRY_AFTER,
-            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+            HeaderValue::from_static("Tue, 01 Jan 2999 00:00:00 GMT"),
         );
-        assert_eq!(parse_retry_after(&h), None);
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(60)));
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn retry_after_http_date_in_past_retries_immediately() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        // The IMF-fixdate example from RFC 9110 — long past by now.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(parse_retry_after(&h), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_garbage_string_is_none() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("not a date"));
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_after_delta_caps_floors_and_computes_exactly() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // Under the cap: exact delta passes through unchanged.
+        assert_eq!(
+            retry_after_delta(now + Duration::from_secs(30), now),
+            Duration::from_secs(30)
+        );
+        // Over the cap: clamped to 60 s regardless of how far out it is.
+        assert_eq!(
+            retry_after_delta(now + Duration::from_secs(3600), now),
+            Duration::from_secs(60)
+        );
+        // Past and present both mean "retry immediately".
+        assert_eq!(
+            retry_after_delta(now - Duration::from_secs(5), now),
+            Duration::ZERO
+        );
+        assert_eq!(retry_after_delta(now, now), Duration::ZERO);
     }
 
     #[test]

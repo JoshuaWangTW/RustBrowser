@@ -1914,6 +1914,7 @@ dependencies = [
  "flate2",
  "futures",
  "htmd",
+ "httpdate",
  "reqwest",
  "rmcp",
  "schemars",
