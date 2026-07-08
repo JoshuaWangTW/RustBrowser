@@ -324,6 +324,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v1.3(Action Loop)** — planner-friendly 回傳(`loop`:`state` / `available_actions` / `recommended_next_actions` / `failure_reason`)· idempotent 步驟 verify + 有限自動重試(`max_action_retries`,預設 1、上限 2;每個 loop attempt 一次 HTTP attempt;高風險 action 永不自動重試)· 操作紀錄 `operation_log`。Browser Use 第三步:把 Observe → Act → **Verify** 收成可規劃的迴圈
 - ✅ **v1.4(Chrome Fallback Broker)** — 明確可解釋的 fallback 決策(`challenge` / `js_app` / `no_actions` / `forced`)· session idempotent 步驟自動升級**一次**有界 headless render,rendered DOM 重走同一條蒸餾管線(絕不回 raw DOM/截圖)· 確認後的非 GET 結果頁永不被瀏覽器重抓 · `session_start` 加 `js` / `js_wait`。Browser Use 第四步:RB 解不了 → 才進 Chrome,而且說得出為什麼
 - ✅ **v1.5(Safety + Eval)** — browser-use benchmark(`tests/benchmark.rs`):六種任務原型(搜尋頁 / 文件站 / 分頁列表 / 表單提交 / 登入後頁面 / JS-heavy SPA)走真實 Session,量測 RB-only 率、fallback 率、request 數、token cost、unsafe-action block、延遲,並鎖定路線圖目標:**一般查找/文件/搜尋型任務 ≥70% 不進 Chrome**(固定評測集上 100%)、危險提交 100% 先擋。Browser Use 第五步:迴圈的行為從「斷言」變成「可量測」
+- ✅ **v1.6(Robustness)** — 架構稽核後補實戰缺口:MCP fetch handler 加整體 wall-clock deadline(修「等很久 → transport closed」的假死)· `text/markdown`/`text/plain` 內容直出、不進 HTML extractor(修乾淨 markdown 被跳脫膨脹:實測某 `.md` 頁 raw 127,767 → 舊 output 131,539 → 新 output 127,767 精確直出)· MCP 三工具預設 `max_output_tokens=20000`(傳 0 解除)· CDP render 補 `kill_on_drop` + session timeout + temp dir Drop guard(修孤兒 Chrome / 無界 hang)· 暫時性錯誤(429/5xx)不再入 cache · `Retry-After` 支援 HTTP-date
 
 ## 技術棧
 

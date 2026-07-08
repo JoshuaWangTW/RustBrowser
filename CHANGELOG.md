@@ -5,6 +5,51 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.6.0]
+
+**Robustness** — closing real-world gaps found by an architecture audit after
+the Browser-Use roadmap. The headline is the last open field issue: an MCP
+`fetch_url` that "waited a long time, then Transport closed".
+
+### Fixed
+- **MCP handler wall-clock deadline** — every fetch tool (`fetch_url`,
+  `observe_url`, `fetch_urls`) now wraps its work in an overall timeout. The
+  reqwest `timeout` only bounded the HTTP leg; headless render and synchronous
+  extraction could push a call well past the caller's expected `timeout_secs`
+  with no deadline, so a slow page looked like a hang and the client dropped
+  the transport. The budget is `(max_retries + 1) × timeout_secs` plus a margin
+  for render/extract, so a legitimately retrying request is not cut off; only a
+  genuine overrun returns a clean error while the server stays alive.
+- **CDP render leak & unbounded hang** — the `--js-wait-for` (CDP) path now
+  sets `kill_on_drop` on Chrome, bounds the whole DevTools session with a
+  timeout, and removes its temp `user-data-dir` via a `Drop` guard. Previously a
+  cancelled or unresponsive render could orphan a Chrome process and leak a temp
+  directory (notably on Windows).
+- **Transient errors no longer cached** — a `429`/`5xx` response is no longer
+  written to the on-disk cache, so a brief server hiccup can't be served back
+  for the full `cache_ttl`. Stable responses (including `404`) still cache.
+
+### Added
+- **Non-HTML passthrough** — `text/markdown`, `text/x-markdown`, and
+  `text/plain` responses are emitted as-is instead of being run through the HTML
+  extractor. Distilling already-clean Markdown as HTML was escaping its special
+  characters and *inflating* the output (a real `.md` doc measured raw
+  127,767 → output 131,539 tokens); passthrough now preserves it 1:1.
+- **MCP default output cap** — the fetch tools default `max_output_tokens` to
+  `20000` (pass `0` to opt out). The MCP consumer is always an LLM, so an
+  unbounded result could blow past a client's tool-result limit. Library and CLI
+  defaults are unchanged (no cap).
+- **`Retry-After` HTTP-date** — the retry path now honours the IMF-fixdate form
+  (`Wed, 21 Oct 2026 07:28:00 GMT`), not just delta-seconds, using the
+  `httpdate` crate already present in the dependency tree. Past dates retry
+  immediately; future dates are still capped.
+
+### Notes
+- Session tools (`session_*`) intentionally keep their existing per-step retry
+  and fallback bounds and are not wrapped by the new handler deadline — their
+  `settle()` mutates loop state around the await, so an outer cancel is a
+  follow-up, not a drop-in.
+
 ## [1.5.0]
 
 Fifth (final roadmap) Browser-Use step: **Safety + Eval** — the loop's
