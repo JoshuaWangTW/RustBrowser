@@ -252,6 +252,15 @@ impl BrowserCore {
     /// Run the full pipeline for a single URL.
     pub async fn distill(&self, url: &str, opts: &DistillOptions) -> Result<Distilled> {
         let mut fetched = self.fetch_maybe_cached(url, opts).await?;
+
+        // Some responses are already lean text (Markdown/plain text). Forcing
+        // them through the Readability + HTML→Markdown pipeline mangles them
+        // (e.g. escaping literal `\`/`[`) instead of leaving already-clean
+        // content alone, so pass them through unchanged.
+        if is_plaintext_content_type(fetched.content_type.as_deref()) {
+            return Ok(assemble_passthrough(fetched, opts));
+        }
+
         let mut content = extract_content(&fetched, opts)?;
 
         // Headless fallback: re-fetch via a real browser when the HTTP HTML looks
@@ -502,6 +511,88 @@ fn assemble(
     })
 }
 
+/// Whether `content_type` names a media type that is already lean text
+/// (Markdown or plain text) and should bypass the HTML extraction/conversion
+/// pipeline entirely rather than be (mis)treated as HTML.
+fn is_plaintext_content_type(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let media_type = ct
+        .split(';')
+        .next()
+        .unwrap_or(ct)
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        media_type.as_str(),
+        "text/markdown" | "text/x-markdown" | "text/plain"
+    )
+}
+
+/// Build a `Distilled` straight from an already-lean fetch (`text/markdown`,
+/// `text/x-markdown`, `text/plain`) without running Readability or the
+/// HTML→Markdown converter — `fetched.html` already holds the decoded body
+/// verbatim regardless of content type, and running it through the HTML
+/// pipeline anyway would mangle it (e.g. escaping literal `\`/`[`). There is
+/// no HTML to mine for a title, links, tables, or an action tree, and this
+/// path never triggers headless rendering.
+fn assemble_passthrough(fetched: FetchResult, opts: &DistillOptions) -> Distilled {
+    let (markdown, markdown_truncated) = match opts.max_output_tokens {
+        Some(max) => budget::fit(&fetched.html, max),
+        None => (fetched.html.clone(), false),
+    };
+    let (text, text_truncated) = match opts.max_output_tokens {
+        Some(max) => budget::fit(&fetched.html, max),
+        None => (fetched.html.clone(), false),
+    };
+    let truncated = markdown_truncated || text_truncated;
+
+    let stats = opts.measure_tokens.then(|| {
+        let ts = TokenStats::measure(&fetched.html, &markdown);
+        Stats {
+            raw_bytes: fetched.raw_bytes,
+            raw_tokens: ts.raw_tokens,
+            output_tokens: ts.output_tokens,
+            saved_tokens: ts.saved(),
+            saved_ratio: ts.saved_ratio(),
+        }
+    });
+
+    let diagnostics = opts.diagnostics.then(|| {
+        let output_chars = markdown.chars().count();
+        let raw_chars = fetched.html.chars().count().max(1);
+        Diagnostics {
+            profile: opts.profile.label(),
+            raw_bytes: fetched.raw_bytes,
+            output_chars,
+            output_tokens: tokens::count(&markdown),
+            extraction_ratio: output_chars as f64 / raw_chars as f64,
+            link_count: 0,
+            table_count: 0,
+            action_count: 0,
+            used_headless: false,
+            truncated,
+            low_content: markdown.trim().chars().count() < 200,
+        }
+    });
+
+    Distilled {
+        final_url: fetched.final_url,
+        status: fetched.status,
+        title: String::new(),
+        byline: None,
+        excerpt: None,
+        markdown,
+        text,
+        stats,
+        links: None,
+        tables: None,
+        actions: None,
+        diagnostics,
+    }
+}
+
 /// Select content from the fetched page: an explicit CSS `selector` wins;
 /// otherwise the chosen `profile` decides.
 fn extract_content(fetched: &FetchResult, opts: &DistillOptions) -> Result<Content> {
@@ -621,5 +712,31 @@ fn js_mode_label(mode: JsMode) -> &'static str {
         JsMode::Off => "off",
         JsMode::Auto => "auto",
         JsMode::Always => "always",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_content_types_are_detected() {
+        assert!(is_plaintext_content_type(Some("text/markdown")));
+        assert!(is_plaintext_content_type(Some("text/x-markdown")));
+        assert!(is_plaintext_content_type(Some("text/plain")));
+        // Parameters (charset, …) and casing/whitespace don't matter.
+        assert!(is_plaintext_content_type(Some(
+            "text/markdown; charset=utf-8"
+        )));
+        assert!(is_plaintext_content_type(Some("TEXT/PLAIN")));
+        assert!(is_plaintext_content_type(Some("  text/plain  ")));
+    }
+
+    #[test]
+    fn non_plaintext_content_types_are_not_passthrough() {
+        assert!(!is_plaintext_content_type(Some("text/html")));
+        assert!(!is_plaintext_content_type(Some("text/html; charset=utf-8")));
+        assert!(!is_plaintext_content_type(Some("application/json")));
+        assert!(!is_plaintext_content_type(None));
     }
 }

@@ -68,8 +68,7 @@ async fn distills_basic_html_to_markdown() {
         &server,
         "/article",
         ResponseTemplate::new(200)
-            .insert_header("Content-Type", "text/html; charset=utf-8")
-            .set_body_string(ARTICLE),
+            .set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html; charset=utf-8"),
     )
     .await;
 
@@ -93,6 +92,37 @@ async fn distills_basic_html_to_markdown() {
 }
 
 #[tokio::test]
+async fn markdown_content_type_passes_through_unchanged() {
+    let server = MockServer::start().await;
+    // Deliberately full of characters (`, [], \, _, *) that the Readability +
+    // HTML→Markdown pipeline would otherwise escape/mangle if this text were
+    // (mis)treated as HTML.
+    let raw = "# Already Lean\n\nSome `code`, a [link](https://example.com/x), \\backslash\\, _em_ and *bold*.\n";
+    let url = mount_get(
+        &server,
+        "/doc.md",
+        ResponseTemplate::new(200)
+            .set_body_raw(raw.as_bytes().to_vec(), "text/markdown; charset=utf-8"),
+    )
+    .await;
+
+    let opts = DistillOptions {
+        diagnostics: true,
+        ..local_opts()
+    };
+    let d = distill(&url, &opts).await.expect("distill ok");
+
+    assert_eq!(
+        d.markdown, raw,
+        "text/markdown must pass through verbatim, not be HTML-converted/escaped"
+    );
+    assert!(
+        !d.diagnostics.expect("diagnostics requested").used_headless,
+        "passthrough must never trigger headless rendering"
+    );
+}
+
+#[tokio::test]
 async fn follows_relative_redirect_to_final_content() {
     let server = MockServer::start().await;
     mount_get(
@@ -104,9 +134,7 @@ async fn follows_relative_redirect_to_final_content() {
     let final_url = mount_get(
         &server,
         "/final",
-        ResponseTemplate::new(200)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string(ARTICLE),
+        ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
     )
     .await;
 
@@ -207,9 +235,7 @@ async fn respects_max_bytes_limit() {
     let url = mount_get(
         &server,
         "/big",
-        ResponseTemplate::new(200)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string(big),
+        ResponseTemplate::new(200).set_body_raw(big.into_bytes(), "text/html"),
     )
     .await;
 
@@ -240,9 +266,12 @@ async fn surfaces_http_404_status() {
     let url = mount_get(
         &server,
         "/missing",
-        ResponseTemplate::new(404)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string("<html><body><p>Not Found Here</p></body></html>"),
+        ResponseTemplate::new(404).set_body_raw(
+            "<html><body><p>Not Found Here</p></body></html>"
+                .as_bytes()
+                .to_vec(),
+            "text/html",
+        ),
     )
     .await;
 
@@ -286,17 +315,13 @@ async fn batch_fetches_multiple_urls_in_order() {
     let a = mount_get(
         &server,
         "/a",
-        ResponseTemplate::new(200)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string(ARTICLE),
+        ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
     )
     .await;
     let b = mount_get(
         &server,
         "/b",
-        ResponseTemplate::new(200)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string(ARTICLE),
+        ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
     )
     .await;
 
@@ -321,9 +346,12 @@ async fn retries_transient_5xx_then_succeeds() {
     Mock::given(method("GET"))
         .and(path("/flaky"))
         .respond_with(
-            ResponseTemplate::new(503)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string("<html><body><p>temporarily down</p></body></html>"),
+            ResponseTemplate::new(503).set_body_raw(
+                "<html><body><p>temporarily down</p></body></html>"
+                    .as_bytes()
+                    .to_vec(),
+                "text/html",
+            ),
         )
         .up_to_n_times(1)
         .with_priority(1)
@@ -332,9 +360,7 @@ async fn retries_transient_5xx_then_succeeds() {
     Mock::given(method("GET"))
         .and(path("/flaky"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string(ARTICLE),
+            ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
         )
         .with_priority(5)
         .mount(&server)
@@ -355,9 +381,12 @@ async fn surfaces_final_status_after_exhausting_retries() {
     let url = mount_get(
         &server,
         "/down",
-        ResponseTemplate::new(503)
-            .insert_header("Content-Type", "text/html")
-            .set_body_string("<html><body><p>still down</p></body></html>"),
+        ResponseTemplate::new(503).set_body_raw(
+            "<html><body><p>still down</p></body></html>"
+                .as_bytes()
+                .to_vec(),
+            "text/html",
+        ),
     )
     .await;
 
@@ -389,9 +418,12 @@ async fn transient_5xx_response_is_not_cached() {
     Mock::given(method("GET"))
         .and(path(route.as_str()))
         .respond_with(
-            ResponseTemplate::new(503)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string("<html><body><p>temporarily down</p></body></html>"),
+            ResponseTemplate::new(503).set_body_raw(
+                "<html><body><p>temporarily down</p></body></html>"
+                    .as_bytes()
+                    .to_vec(),
+                "text/html",
+            ),
         )
         .up_to_n_times(1)
         .with_priority(1)
@@ -400,9 +432,7 @@ async fn transient_5xx_response_is_not_cached() {
     Mock::given(method("GET"))
         .and(path(route.as_str()))
         .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string(ARTICLE),
+            ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
         )
         .with_priority(5)
         .mount(&server)
@@ -443,9 +473,7 @@ async fn robots_txt_blocks_only_when_respected() {
     Mock::given(method("GET"))
         .and(path("/secret/page"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string(ARTICLE),
+            ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
         )
         .mount(&server)
         .await;
@@ -489,9 +517,7 @@ async fn robots_txt_blocks_disallowed_redirect_target() {
     Mock::given(method("GET"))
         .and(path("/secret/page"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Type", "text/html")
-                .set_body_string(ARTICLE),
+            ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
         )
         .mount(&server)
         .await;
@@ -518,9 +544,7 @@ async fn rate_limit_spaces_same_host_requests() {
             mount_get(
                 &server,
                 p,
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "text/html")
-                    .set_body_string(ARTICLE),
+                ResponseTemplate::new(200).set_body_raw(ARTICLE.as_bytes().to_vec(), "text/html"),
             )
             .await,
         );
