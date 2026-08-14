@@ -5,6 +5,66 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.7.0]
+
+**From the fixed suite to the real world** — the Browser-Use loop's promises
+are now continuously measured against real websites, and its two biggest
+real-world gaps (login-gated JS pages, unbounded session steps) are closed.
+
+### ⚠️ Security default change — fallback renders now carry session cookies
+
+Up to 1.6, the docs promised the session cookie jar was **never** shared with
+the fallback browser. **1.7 changes that default**: when a session step
+escalates to the Chrome Fallback Broker and the session holds cookies for the
+exact URL being re-rendered, those cookies are injected (CDP
+`Network.setCookie`, scoped by URL) into a fresh, single-use Chrome
+`--user-data-dir`. Only that URL's cookies are sent — never the whole jar —
+cookie names/values are never written to `operation_log` or any diagnostic
+output, `Network.clearBrowserCookies` runs before teardown, and the temp
+profile is deleted (with retries on Windows file locking). A login-gated JS
+page can now render as logged-in in the fallback; anonymous sessions are
+unaffected. Set `RUSTBROWSER_FALLBACK_NO_COOKIES=1` to restore the pre-1.7
+anonymous-only behaviour. `SECURITY.md`, `README.md`, and `docs/API.md` were
+rewritten accordingly.
+
+### Added
+- **Nightly live-site CI** (`tests/live.rs` + `.github/workflows/nightly-live.yml`)
+  — five `#[ignore]`d shape-invariant tests against real sites (canary,
+  markdown passthrough, MDN, docs.rs actions, docs.rs session), run nightly on
+  a schedule that cannot block merges (no PR trigger, failures open a
+  `live-regression` issue). Its very first run caught real drift: the v1.6
+  issue URL (codex-manual.md) now serves `application/octet-stream` and no
+  longer reaches passthrough — logged in `RB_FETCH_ISSUES.md`, lock retargeted
+  to a tag-pinned raw.githubusercontent file.
+- **`render::render_html_cdp_with` + `CdpRender`** — additive render API:
+  optional wait-selector (`None` now waits on `document.readyState` instead of
+  probing an empty selector) and optional cookie injection. The existing
+  `render_html_cdp` signature is preserved as a thin wrapper.
+- **`Session::step_budget()`** — the wall-clock budget of one session step,
+  derived from existing knobs (`(max_action_retries + 1) × timeout`, maxed
+  with `js_wait`, plus margin). No new MCP parameters.
+- **Login smoke test** (`tests/smoke_login.rs`, `#[ignore]`, needs Chrome) —
+  wiremock login site + real Chrome proves the cookie actually reaches the
+  fallback render (and the kill switch verifiably disables it).
+
+### Fixed
+- **Session steps are now bounded** — all four MCP session tools
+  (`session_start` previously had no bound at all) wrap their work in
+  `step_budget()`; a genuine overrun returns a clean error stating the session
+  is unchanged and still usable, instead of hanging until the client drops the
+  transport. A timed-out **confirmed non-GET** submit says explicitly that the
+  request may have been sent and must not be retried (and never is,
+  automatically).
+- **`Session::settle()` is cancellation-safe** — refactored into
+  `prepare_settle` (`&self`, the only `await`) + `commit_settle` (synchronous):
+  the five state fields (`current_url`, `last_snapshot`, `redirect_history`,
+  `last_failure`, `last_fallback`) now change together or not at all, so an
+  outer timeout can no longer strand the session between them. This is the
+  prerequisite that made the session deadlines safe to add.
+- **CDP temp-profile removal retries on Windows** — a just-exited Chrome can
+  transiently lock the directory; now that it may contain injected cookies,
+  removal retries and loudly warns instead of silently giving up.
+
 ## [1.6.0]
 
 **Robustness** — closing real-world gaps found by an architecture audit after

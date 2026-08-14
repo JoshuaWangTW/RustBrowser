@@ -235,7 +235,8 @@ Fallback Policy 的嚴格分層:**RB 解不了 → 才進 Chrome**。v1.4 把「
   - `no_actions` —— 要求 action tree 卻一個可操作元素都沒有,而頁面明顯在跑 script(表單/連結由 JS 動態生成)。
   - `forced` —— `js=always` 強制。
 - **升級行為**:session 的 idempotent 步驟 settle 後,broker 對該 URL 跑**一次**有界 headless render(沿用既有 sandbox + DOM 上限),rendered DOM **重新走同一條 token-lean 蒸餾管線** —— LLM 拿到的仍是壓縮後的內容 + action tree,**絕不塞 raw DOM 或截圖**。render 失敗非致命(保留 HTTP snapshot,log 記 `chrome_fallback_failed`)。
-- **安全邊界**:只有 idempotent 步驟會升級;**已確認的非 GET 提交結果頁絕不會被瀏覽器重抓**。fallback 瀏覽器是獨立行程,**不帶 session cookies**(登入牆後頁面可能渲染不同 —— planner 可由 `fallback_reason` + `used_headless` 判讀)。
+- **安全邊界**:只有 idempotent 步驟會升級;**已確認的非 GET 提交結果頁絕不會被瀏覽器重抓**。
+- **v1.7 起,fallback 瀏覽器改為攜帶 session cookies(隔離 profile)**:session 若已持有正在渲染那個 URL 的 cookie,會透過 CDP `Network.setCookie` 注入到一個**全新、僅此一次的 Chrome `--user-data-dir`**——只送出這一個 URL 該有的 cookie,絕不是整包 jar,且 cookie 值只在這條本機 CDP 連線上出現,絕不寫進 `operation_log` 或任何診斷輸出。render 結束前先送 `Network.clearBrowserCookies`,接著刪除該 temp profile 目錄(Windows 上剛結束的 Chrome 可能短暫鎖檔,因此會重試幾次;刪不掉屬安全風險,會留下警告而非靜默放棄)。這代表登入牆後頁面現在能在 fallback 渲染出登入後的內容(先前一律匿名渲染;可由 `fallback_reason` + `used_headless` 判讀)。沒有 cookie 的匿名 session 行為不變。要恢復 v1.7 之前「fallback 一律匿名」的行為,設定環境變數 `RUSTBROWSER_FALLBACK_NO_COOKIES=1`。
 - **控制**:`session_start` 的 `js`(off / auto 預設 / always)與 `js_wait`(毫秒)。
 
 ## 使用方式:給 Claude Code 用(MCP)
@@ -324,6 +325,7 @@ CI 會執行 fmt、clippy、build、test、release build,並檢查 release binar
 - ✅ **v1.3(Action Loop)** — planner-friendly 回傳(`loop`:`state` / `available_actions` / `recommended_next_actions` / `failure_reason`)· idempotent 步驟 verify + 有限自動重試(`max_action_retries`,預設 1、上限 2;每個 loop attempt 一次 HTTP attempt;高風險 action 永不自動重試)· 操作紀錄 `operation_log`。Browser Use 第三步:把 Observe → Act → **Verify** 收成可規劃的迴圈
 - ✅ **v1.4(Chrome Fallback Broker)** — 明確可解釋的 fallback 決策(`challenge` / `js_app` / `no_actions` / `forced`)· session idempotent 步驟自動升級**一次**有界 headless render,rendered DOM 重走同一條蒸餾管線(絕不回 raw DOM/截圖)· 確認後的非 GET 結果頁永不被瀏覽器重抓 · `session_start` 加 `js` / `js_wait`。Browser Use 第四步:RB 解不了 → 才進 Chrome,而且說得出為什麼
 - ✅ **v1.5(Safety + Eval)** — browser-use benchmark(`tests/benchmark.rs`):六種任務原型(搜尋頁 / 文件站 / 分頁列表 / 表單提交 / 登入後頁面 / JS-heavy SPA)走真實 Session,量測 RB-only 率、fallback 率、request 數、token cost、unsafe-action block、延遲,並鎖定路線圖目標:**一般查找/文件/搜尋型任務 ≥70% 不進 Chrome**(固定評測集上 100%)、危險提交 100% 先擋。Browser Use 第五步:迴圈的行為從「斷言」變成「可量測」
+- ✅ **v1.7(從固定集走向真實世界)** — nightly 真站 CI(`tests/live.rs` 形狀不變式測試 + 非阻塞 workflow,第一次跑就抓到 codex-manual.md 改回 `application/octet-stream` 的真實漂移)· `Session::settle()` 原子性重構(計算 `&self`/提交同步分離,cancel 不留不一致狀態)· **Chrome fallback 帶 session cookie**(隔離 single-use profile、只送該 URL 的 cookie、render 完即清,`RUSTBROWSER_FALLBACK_NO_COOKIES=1` 可關——登入牆後的 JS 頁面自此能渲染出登入內容)· session 四工具補 wall-clock deadline(`step_budget` 推導自既有參數,超時回乾淨錯誤且 session 可續用;非 GET 超時明示「可能已送出勿重試」)
 - ✅ **v1.6(Robustness)** — 架構稽核後補實戰缺口:MCP fetch handler 加整體 wall-clock deadline(修「等很久 → transport closed」的假死)· `text/markdown`/`text/plain` 內容直出、不進 HTML extractor(修乾淨 markdown 被跳脫膨脹:實測某 `.md` 頁 raw 127,767 → 舊 output 131,539 → 新 output 127,767 精確直出)· MCP 三工具預設 `max_output_tokens=20000`(傳 0 解除)· CDP render 補 `kill_on_drop` + session timeout + temp dir Drop guard(修孤兒 Chrome / 無界 hang)· 暫時性錯誤(429/5xx)不再入 cache · `Retry-After` 支援 HTTP-date
 
 ## 技術棧

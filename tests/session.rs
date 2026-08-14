@@ -548,3 +548,38 @@ async fn confirmed_post_result_is_never_re_rendered() {
         "no fallback attempt for a confirmed POST"
     );
 }
+
+#[tokio::test]
+async fn fallback_reason_is_always_backed_by_a_log_entry() {
+    // Pins the R2/R4 settle semantics: whenever the broker escalates,
+    // `last_fallback` holds `Some(reason)` — whether the render succeeded or
+    // failed — and that is never true without a matching `chrome_fallback` /
+    // `chrome_fallback_failed` log entry to explain why.
+    let server = MockServer::start().await;
+    spa(&server).await;
+
+    let mut s = Session::new(DistillOptions {
+        js_wait: Some(1500),
+        ..opts()
+    })
+    .unwrap();
+    s.observe(&format!("{}/app", server.uri())).await.unwrap();
+
+    let fallback_reason = s.loop_view().state.fallback_reason;
+    assert!(
+        fallback_reason.is_some(),
+        "SPA shell must trigger a fallback decision"
+    );
+    let has_backing_log_entry = s
+        .log()
+        .iter()
+        .any(|e| e.outcome == "chrome_fallback" || e.outcome == "chrome_fallback_failed");
+    assert!(
+        has_backing_log_entry,
+        "fallback_reason set without a chrome_fallback(_failed) log entry (log: {:?})",
+        s.log()
+            .iter()
+            .map(|e| e.outcome.as_str())
+            .collect::<Vec<_>>()
+    );
+}
