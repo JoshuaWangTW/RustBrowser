@@ -113,10 +113,9 @@ pub struct Fetcher {
     opts: FetchOptions,
     gate: Arc<HostGate>,
     /// Present when `opts.cookie_store` is on; lets a session read back the
-    /// cookies it has received for a given origin (see `cookie_header_for`).
-    /// Not yet wired into production code — R4 will feed this to the Chrome
-    /// Fallback Broker.
-    #[allow(dead_code)]
+    /// cookies it has received for a given origin (see `cookie_header_for`),
+    /// which the session feeds to the Chrome Fallback Broker's isolated
+    /// render.
     cookie_jar: Option<Arc<Jar>>,
     #[cfg(feature = "robots")]
     robots: Arc<crate::robots::RobotsCache>,
@@ -175,10 +174,6 @@ impl Fetcher {
     /// general-purpose cookie export. `Jar::cookies` only yields `name=value`
     /// pairs (no Secure/HttpOnly flags or expiry), so this is unsuitable for
     /// anything resembling persistence.
-    ///
-    /// Not yet called from production code — R4 will feed this to the Chrome
-    /// Fallback Broker.
-    #[allow(dead_code)]
     pub(crate) fn cookie_header_for(&self, url: &str) -> Option<String> {
         let jar = self.cookie_jar.as_ref()?;
         let parsed = Url::parse(url).ok()?;

@@ -25,13 +25,17 @@
 - [x] `Fetcher` 改 `cookie_provider(Arc<Jar>)` + `cookie_header_for`(暫 #[allow(dead_code)],R4 接線後移除)
 
 ## R4 — CDP cookie render + 接線 + 安全文件(依賴 R2、R3)
-- [ ] `CdpRender` + `render_html_cdp_with`(既有 API 保留為包裝)
-- [ ] `cdp_session`:Network.setCookie(navigate 前)/ readyState probe / clearBrowserCookies / TempDirGuard 刪除重試
-- [ ] `render_fallback`:有 cookie 走 CDP、無 cookie 維持 --dump-dom;`fallback_render_mode` 純函式 + 單元測試
-- [ ] kill switch `RUSTBROWSER_FALLBACK_NO_COOKIES=1`(預設開啟 — Joshua 已裁決)
-- [ ] 測試鎖住「session render 不入 render cache」
-- [ ] SECURITY.md / README.md / docs/API.md 承諾改寫 + CHANGELOG 獨立段落
-- [ ] 煙測:本機假登入站完整 session 流程,留證據
+- [x] `CdpRender` + `render_html_cdp_with`(既有 API 保留為包裝)
+- [x] `cdp_session`:Network.setCookie(navigate 前)/ readyState probe / clearBrowserCookies / TempDirGuard 刪除重試
+- [x] `render_fallback`:有 cookie 走 CDP、無 cookie 維持 --dump-dom;`fallback_render_mode` 純函式 + 單元測試
+- [x] kill switch `RUSTBROWSER_FALLBACK_NO_COOKIES=1`(預設開啟 — Joshua 已裁決)
+- [x] 測試鎖住 `session_never_uses_the_on_disk_cache`
+- [x] SECURITY.md / README.md / docs/API.md 承諾改寫(CHANGELOG 留收斂輪)
+- [x] 煙測:`tests/smoke_login.rs`(#[ignore],wiremock 假登入站 + 真 Chrome)——正向:cookie 注入後 render 出登入內容 SECRET-DASHBOARD-42;反向:kill switch 開時如預期拿到匿名 PLEASE-LOG-IN 而紅。2026-08-14 實跑證據留存
+
+> R4 落差(來源:R4 煙測):rendered DOM 的 inline `<script>` 文字會漏進 markdown
+> (失敗訊息裡看到 script 原文)。distill 品質項,不影響 v1.7 goal,未排程——
+> 候選 v1.8 擷取品質輪。
 
 ## R5 — session outer deadline(依賴 R2、R4)
 - [ ] `Session::step_budget()`(沿用 handler_budget 公式)

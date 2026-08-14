@@ -143,10 +143,24 @@ forms. The relevant safeguards:
   (`challenge`/`js_app`/`no_actions`/`forced`). A confirmed non-GET submit's
   result page is never re-fetched by a browser. The render reuses the hardened
   headless path (sandbox ON by default, streamed DOM cap) and re-distills the
-  DOM — raw DOM never reaches the caller. The session's cookie jar is **not**
-  shared with the fallback browser process, so session credentials never leave
-  RB's HTTP client; the trade-off is that login-gated pages may render
-  differently in the fallback (visible via `fallback_reason` + `used_headless`).
+  DOM — raw DOM never reaches the caller.
+- **Fallback renders now carry session cookies, into an isolated profile
+  (v1.7)** — when the session already holds cookies for the exact URL being
+  re-rendered, they are injected via CDP `Network.setCookie` into a fresh,
+  single-use Chrome `--user-data-dir` before navigation. Only that one URL's
+  cookies are sent, never the whole jar, and they never leave this local CDP
+  connection — cookie names and values are never written to `operation_log`
+  or any other diagnostic output. The browser process is bounded exactly like
+  every other headless render (sandbox ON by default, streamed DOM cap,
+  timeout); on the way out, `Network.clearBrowserCookies` runs and the temp
+  profile directory is deleted (retried a few times, since Windows can
+  transiently keep a just-exited Chrome's files locked — a leftover cookie on
+  disk would be a real regression, so this doesn't give up after one try).
+  This means a login-gated page can now render as a logged-in user in the
+  fallback (previously it always rendered anonymously; visible via
+  `fallback_reason` + `used_headless`). An anonymous session (no cookies for
+  the URL) is unaffected. Set `RUSTBROWSER_FALLBACK_NO_COOKIES=1` to restore
+  the pre-1.7 anonymous-only fallback behaviour.
 
 ## Hardening checklist for operators
 

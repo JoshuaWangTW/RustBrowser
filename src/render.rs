@@ -238,20 +238,49 @@ pub async fn render_html(_url: &str, _wait: Duration) -> Result<String> {
     bail!("headless rendering requires the 'js' feature")
 }
 
+/// Options for [`render_html_cdp_with`]: which selector (if any) to wait for
+/// before capturing the DOM, and which cookies (if any) to inject into the
+/// isolated render profile before navigating.
+#[derive(Debug, Default)]
+pub struct CdpRender<'a> {
+    /// CSS selector to wait for before capturing the DOM. `None` waits for
+    /// `document.readyState === "complete"` instead.
+    pub wait_for: Option<&'a str>,
+    /// `Cookie:`-header-style `name=value; name2=value2` pairs to inject into
+    /// the isolated render profile before navigating. Only sent to the exact
+    /// `url` being rendered — never a whole jar, never logged.
+    pub cookies: Option<&'a str>,
+}
+
 #[cfg(feature = "js")]
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Removes the Chrome `--user-data-dir` temp directory on drop, so cleanup
 /// still runs if `render_html_cdp`'s future is cancelled or panics before
 /// reaching its normal teardown path (a plain end-of-function cleanup call
-/// would miss both cases).
+/// would miss both cases). Retries a few times on Windows, where an
+/// about-to-exit Chrome process can transiently hold the directory (or a
+/// cookie file inside it) locked — leaving injected cookies on disk would be
+/// a security regression, so we don't give up after one attempt.
 #[cfg(feature = "js")]
 struct TempDirGuard(std::path::PathBuf);
 
 #[cfg(feature = "js")]
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.0.exists() {
+            return;
+        }
+        for attempt in 0..3 {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(_) if attempt < 2 => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => eprintln!(
+                    "rustbrowser: could not remove render temp profile {} after 3 attempts: {e}",
+                    self.0.display()
+                ),
+            }
+        }
     }
 }
 
@@ -259,8 +288,35 @@ impl Drop for TempDirGuard {
 /// CSS selector) appears in the DOM before capturing it. If the selector never
 /// shows up within `budget`, we capture whatever is present. Heavier than
 /// `--dump-dom`, but lets you wait for content that loads asynchronously.
+///
+/// Thin wrapper over [`render_html_cdp_with`] for callers that only need the
+/// selector-wait behaviour (no cookie injection).
 #[cfg(feature = "js")]
 pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Result<String> {
+    render_html_cdp_with(
+        url,
+        budget,
+        CdpRender {
+            wait_for: Some(wait_for),
+            cookies: None,
+        },
+    )
+    .await
+}
+
+/// Stub used when built without the `js` feature.
+#[cfg(not(feature = "js"))]
+pub async fn render_html_cdp(_url: &str, _wait_for: &str, _budget: Duration) -> Result<String> {
+    bail!("headless rendering requires the 'js' feature")
+}
+
+/// Render `url` over the Chrome DevTools Protocol with the given [`CdpRender`]
+/// options: an optional selector to wait for, and optional cookies to inject
+/// into an isolated, single-use Chrome profile before navigating (see
+/// `SECURITY.md`). The profile is deleted and its cookies cleared on the way
+/// out, whether or not cookies were injected.
+#[cfg(feature = "js")]
+pub async fn render_html_cdp_with(url: &str, budget: Duration, r: CdpRender<'_>) -> Result<String> {
     let chrome = find_chrome()
         .context("no Chrome/Chromium/Edge found; set RUSTBROWSER_CHROME to its full path")?;
 
@@ -294,7 +350,7 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
     // caller falls back to the plain HTTP snapshot.
     let outcome = match timeout(
         budget + Duration::from_secs(15),
-        cdp_session(url, wait_for, budget, &user_dir),
+        cdp_session(url, r.wait_for, r.cookies, budget, &user_dir),
     )
     .await
     {
@@ -309,14 +365,51 @@ pub async fn render_html_cdp(url: &str, wait_for: &str, budget: Duration) -> Res
 
 /// Stub used when built without the `js` feature.
 #[cfg(not(feature = "js"))]
-pub async fn render_html_cdp(_url: &str, _wait_for: &str, _budget: Duration) -> Result<String> {
+pub async fn render_html_cdp_with(
+    _url: &str,
+    _budget: Duration,
+    _r: CdpRender<'_>,
+) -> Result<String> {
     bail!("headless rendering requires the 'js' feature")
+}
+
+/// The JS expression used to decide whether the page is ready to capture:
+/// wait for `wait_for` (a CSS selector) if given, otherwise fall back to
+/// `document.readyState === "complete"` rather than probing for an empty
+/// selector.
+#[cfg(feature = "js")]
+fn cdp_ready_probe(wait_for: Option<&str>) -> String {
+    match wait_for {
+        Some(sel) => {
+            let selector_json = serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".into());
+            format!("!!document.querySelector({selector_json})")
+        }
+        None => "document.readyState === \"complete\"".to_string(),
+    }
+}
+
+/// Parse a `Cookie:`-header-style string (`name=value; name2=value2`) into
+/// `(name, value)` pairs, skipping malformed or empty segments.
+#[cfg(feature = "js")]
+fn parse_cookie_pairs(s: &str) -> Vec<(String, String)> {
+    s.split(';')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (name, value) = part.split_once('=')?;
+            let (name, value) = (name.trim(), value.trim());
+            (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 #[cfg(feature = "js")]
 async fn cdp_session(
     url: &str,
-    wait_for: &str,
+    wait_for: Option<&str>,
+    cookies: Option<&str>,
     budget: Duration,
     user_dir: &Path,
 ) -> Result<String> {
@@ -326,15 +419,39 @@ async fn cdp_session(
         .await
         .context("connecting to Chrome DevTools")?;
 
-    cdp_call(&mut ws, 1, "Page.enable", json!({})).await?;
-    cdp_call(&mut ws, 2, "Page.navigate", json!({ "url": url })).await?;
+    let mut id = 1u64;
+    cdp_call(&mut ws, id, "Page.enable", json!({})).await?;
+    id += 1;
 
-    let selector_json = serde_json::to_string(wait_for).unwrap_or_else(|_| "\"\"".into());
-    let probe = format!("!!document.querySelector({selector_json})");
+    // Cookies are injected before navigation so they're present on the very
+    // first request. `url` scopes each `Network.setCookie` call so Chrome
+    // derives the right domain/path — only the URL being rendered ever sees
+    // them, never a whole jar. Never logged: values only ever cross this
+    // local CDP WebSocket.
+    let cookie_pairs = cookies.map(parse_cookie_pairs).unwrap_or_default();
+    if !cookie_pairs.is_empty() {
+        cdp_call(&mut ws, id, "Network.enable", json!({})).await?;
+        id += 1;
+        for (name, value) in &cookie_pairs {
+            cdp_call(
+                &mut ws,
+                id,
+                "Network.setCookie",
+                json!({ "name": name, "value": value, "url": url }),
+            )
+            .await?;
+            id += 1;
+        }
+    }
+
+    cdp_call(&mut ws, id, "Page.navigate", json!({ "url": url })).await?;
+    id += 1;
+
+    let probe = cdp_ready_probe(wait_for);
     let deadline = Instant::now() + budget;
-    let mut id = 3u64;
     loop {
         if cdp_eval(&mut ws, id, &probe).await?.as_bool() == Some(true) {
+            id += 1;
             break;
         }
         id += 1;
@@ -347,7 +464,15 @@ async fn cdp_session(
     // Cap by UTF-8 bytes in the browser so the CDP payload itself is bounded.
     // `cap_dom` remains a byte-level backstop after JSON decoding.
     let expr = cdp_byte_capped_outer_html_expr(MAX_RENDER_BYTES);
-    let dom = cdp_eval(&mut ws, id + 1, &expr).await?;
+    let dom = cdp_eval(&mut ws, id, &expr).await?;
+    id += 1;
+
+    // Teardown: clear any cookies we injected before the process (and its
+    // temp profile directory, via TempDirGuard) go away.
+    if !cookie_pairs.is_empty() {
+        let _ = cdp_call(&mut ws, id, "Network.clearBrowserCookies", json!({})).await;
+    }
+
     dom.as_str()
         .map(str::to_string)
         .map(cap_dom)
@@ -528,6 +653,47 @@ mod tests {
         assert!(capped.len() <= MAX_RENDER_BYTES);
         // If it compiled to a String it is valid UTF-8; round-trip to be sure.
         assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn ready_probe_waits_for_selector_when_given() {
+        let probe = cdp_ready_probe(Some("#root"));
+        assert!(probe.contains("querySelector"));
+        assert!(probe.contains("#root"));
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn ready_probe_falls_back_to_document_ready_state_without_selector() {
+        assert_eq!(
+            cdp_ready_probe(None),
+            "document.readyState === \"complete\""
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn parses_cookie_header_into_pairs() {
+        assert_eq!(
+            parse_cookie_pairs("sid=abc; theme=dark"),
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("theme".to_string(), "dark".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(feature = "js")]
+    #[test]
+    fn parse_cookie_pairs_skips_malformed_or_empty_segments() {
+        assert_eq!(
+            parse_cookie_pairs("sid=abc; ; malformed; =novalue; k=v"),
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("k".to_string(), "v".to_string()),
+            ]
+        );
     }
 
     #[cfg(feature = "js")]

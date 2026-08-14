@@ -235,7 +235,8 @@ Fallback Policy 的嚴格分層:**RB 解不了 → 才進 Chrome**。v1.4 把「
   - `no_actions` —— 要求 action tree 卻一個可操作元素都沒有,而頁面明顯在跑 script(表單/連結由 JS 動態生成)。
   - `forced` —— `js=always` 強制。
 - **升級行為**:session 的 idempotent 步驟 settle 後,broker 對該 URL 跑**一次**有界 headless render(沿用既有 sandbox + DOM 上限),rendered DOM **重新走同一條 token-lean 蒸餾管線** —— LLM 拿到的仍是壓縮後的內容 + action tree,**絕不塞 raw DOM 或截圖**。render 失敗非致命(保留 HTTP snapshot,log 記 `chrome_fallback_failed`)。
-- **安全邊界**:只有 idempotent 步驟會升級;**已確認的非 GET 提交結果頁絕不會被瀏覽器重抓**。fallback 瀏覽器是獨立行程,**不帶 session cookies**(登入牆後頁面可能渲染不同 —— planner 可由 `fallback_reason` + `used_headless` 判讀)。
+- **安全邊界**:只有 idempotent 步驟會升級;**已確認的非 GET 提交結果頁絕不會被瀏覽器重抓**。
+- **v1.7 起,fallback 瀏覽器改為攜帶 session cookies(隔離 profile)**:session 若已持有正在渲染那個 URL 的 cookie,會透過 CDP `Network.setCookie` 注入到一個**全新、僅此一次的 Chrome `--user-data-dir`**——只送出這一個 URL 該有的 cookie,絕不是整包 jar,且 cookie 值只在這條本機 CDP 連線上出現,絕不寫進 `operation_log` 或任何診斷輸出。render 結束前先送 `Network.clearBrowserCookies`,接著刪除該 temp profile 目錄(Windows 上剛結束的 Chrome 可能短暫鎖檔,因此會重試幾次;刪不掉屬安全風險,會留下警告而非靜默放棄)。這代表登入牆後頁面現在能在 fallback 渲染出登入後的內容(先前一律匿名渲染;可由 `fallback_reason` + `used_headless` 判讀)。沒有 cookie 的匿名 session 行為不變。要恢復 v1.7 之前「fallback 一律匿名」的行為,設定環境變數 `RUSTBROWSER_FALLBACK_NO_COOKIES=1`。
 - **控制**:`session_start` 的 `js`(off / auto 預設 / always)與 `js_wait`(毫秒)。
 
 ## 使用方式:給 Claude Code 用(MCP)

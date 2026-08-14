@@ -116,6 +116,15 @@ it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 
 `session_close` forgets the session and returns `{session_id, closed}`.
 
+When a step escalates to the Chrome Fallback Broker (`fallback_reason` set),
+the session's cookies for the URL being rendered are injected into an
+isolated, single-use Chrome profile (since 1.7) — only that URL's cookies,
+never the whole jar, and never written to `operation_log` or any other
+output; the profile is cookie-cleared and deleted immediately after the
+render. This lets a login-gated page render as logged-in in the fallback.
+Set `RUSTBROWSER_FALLBACK_NO_COOKIES=1` to force the pre-1.7 anonymous-only
+fallback render. See `SECURITY.md` for the full detail.
+
 | Tool | Params | Notes |
 |---|---|---|
 | `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries`, `js` (`off`/`auto`/`always`, default `auto`), `js_wait` (ms) | Opens `url`, returns a `session_id` + first snapshot + `loop`. |

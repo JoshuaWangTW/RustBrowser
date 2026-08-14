@@ -42,6 +42,50 @@ const MAX_LOG_ENTRIES: usize = 200;
 /// Truncate a logged error message to this many characters.
 const MAX_LOGGED_ERR_CHARS: usize = 200;
 
+/// Kill switch: set to a truthy value to force the fallback render back to
+/// the old anonymous-only (`--dump-dom`) path even when the session holds
+/// cookies for the URL being rendered. See `SECURITY.md`.
+const FALLBACK_NO_COOKIES_ENV: &str = "RUSTBROWSER_FALLBACK_NO_COOKIES";
+
+/// Which render path the fallback broker should use — decided purely from
+/// whether the session has cookies for the URL and the kill switch, so it's
+/// unit-testable without a real Chrome or session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FallbackRenderMode {
+    /// No session cookies for this URL (or the kill switch is set): keep the
+    /// existing `--dump-dom` path unchanged — anonymous-page behaviour, zero
+    /// regression.
+    Anonymous,
+    /// Inject these cookies (`name=value; name2=value2`) into an isolated CDP
+    /// render profile.
+    WithCookies(String),
+}
+
+/// Pure decision: given the session's cookies for the URL being rendered (if
+/// any) and whether the kill switch is set, which render path to use.
+fn fallback_render_mode(cookies: Option<&str>, no_cookies_override: bool) -> FallbackRenderMode {
+    if no_cookies_override {
+        return FallbackRenderMode::Anonymous;
+    }
+    match cookies {
+        Some(c) if !c.is_empty() => FallbackRenderMode::WithCookies(c.to_string()),
+        _ => FallbackRenderMode::Anonymous,
+    }
+}
+
+/// Parse `RUSTBROWSER_FALLBACK_NO_COOKIES` as a truthy flag (mirrors
+/// `render::is_truthy_flag`'s convention: empty/`0`/`false` are falsy).
+fn fallback_no_cookies_requested() -> bool {
+    std::env::var(FALLBACK_NO_COOKIES_ENV)
+        .map(|v| is_truthy_env_flag(&v))
+        .unwrap_or(false)
+}
+
+fn is_truthy_env_flag(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+}
+
 /// A stateful browsing session.
 pub struct Session {
     fetcher: Fetcher,
@@ -509,15 +553,33 @@ impl Session {
     }
 
     /// One bounded headless render of `url`. The render is a separate browser
-    /// process: the session's cookie jar is NOT carried into it (see
-    /// SECURITY.md), so a page behind a session login may render differently.
+    /// process; when the session already holds cookies for `url`, they are
+    /// injected into an isolated, single-use Chrome profile so a page behind
+    /// a session login renders as logged-in (see SECURITY.md). Set
+    /// `RUSTBROWSER_FALLBACK_NO_COOKIES=1` to force the old anonymous-only
+    /// behaviour. An anonymous session (no cookies) is unaffected either way.
     async fn render_fallback(&self, url: &str) -> Result<String> {
         let budget = self
             .opts
             .js_wait
             .map(Duration::from_millis)
             .unwrap_or(self.opts.timeout);
-        render::render_html(url, budget).await
+
+        let cookies = self.fetcher.cookie_header_for(url);
+        match fallback_render_mode(cookies.as_deref(), fallback_no_cookies_requested()) {
+            FallbackRenderMode::WithCookies(cookies) => {
+                render::render_html_cdp_with(
+                    url,
+                    budget,
+                    render::CdpRender {
+                        cookies: Some(&cookies),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }
+            FallbackRenderMode::Anonymous => render::render_html(url, budget).await,
+        }
     }
 
     /// Record the settled current URL in the redirect history (one entry per
@@ -734,6 +796,67 @@ mod tests {
         let opts = DistillOptions::default();
         let s = Session::new(opts).unwrap().with_max_action_retries(99);
         assert_eq!(s.max_action_retries, MAX_ACTION_RETRIES_CAP);
+    }
+
+    #[test]
+    fn fallback_render_mode_uses_cookies_when_present() {
+        assert_eq!(
+            fallback_render_mode(Some("sid=abc"), false),
+            FallbackRenderMode::WithCookies("sid=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_render_mode_is_anonymous_without_cookies() {
+        assert_eq!(
+            fallback_render_mode(None, false),
+            FallbackRenderMode::Anonymous
+        );
+    }
+
+    #[test]
+    fn fallback_render_mode_treats_empty_cookie_string_as_anonymous() {
+        assert_eq!(
+            fallback_render_mode(Some(""), false),
+            FallbackRenderMode::Anonymous
+        );
+    }
+
+    #[test]
+    fn fallback_render_mode_kill_switch_forces_anonymous_even_with_cookies() {
+        assert_eq!(
+            fallback_render_mode(Some("sid=abc"), true),
+            FallbackRenderMode::Anonymous
+        );
+    }
+
+    #[test]
+    fn kill_switch_env_flag_parsing_matches_render_module_convention() {
+        assert!(is_truthy_env_flag("1"));
+        assert!(is_truthy_env_flag("true"));
+        assert!(is_truthy_env_flag("YES"));
+        assert!(!is_truthy_env_flag("0"));
+        assert!(!is_truthy_env_flag("false"));
+        assert!(!is_truthy_env_flag("False"));
+        assert!(!is_truthy_env_flag(""));
+        assert!(!is_truthy_env_flag("   "));
+    }
+
+    /// A session must never read or write the on-disk fetch/render cache,
+    /// even if the caller's `DistillOptions` asked for it — `Session::new`
+    /// forces `use_cache` off so every snapshot reflects live state
+    /// (including a fallback render that may carry session cookies).
+    #[test]
+    fn session_never_uses_the_on_disk_cache() {
+        let opts = DistillOptions {
+            use_cache: true,
+            ..Default::default()
+        };
+        let s = Session::new(opts).unwrap();
+        assert!(
+            !s.opts.use_cache,
+            "session snapshots must never read/write the on-disk cache"
+        );
     }
 
     /// The five fields that describe "where the session is": `current_url`,
