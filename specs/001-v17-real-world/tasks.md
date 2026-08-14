@@ -38,13 +38,14 @@
 > 候選 v1.8 擷取品質輪。
 
 ## R5 — session outer deadline(依賴 R2、R4)
-- [ ] `Session::step_budget()`(沿用 handler_budget 公式)
-- [ ] 四個 session handler 包 timeout(含 session_start);非 GET 錯誤訊息「可能已送出,勿重試」
-- [ ] 紅測試:超 budget 返回乾淨錯誤 + 同 session 可續用
-- [ ] docs/API.md + SECURITY.md 補 deadline 語意
-- [ ] (加分)MCP 工具名凍結測試
+- [x] `Session::step_budget()`(即時計算不存欄位——偏離 plan 但更簡,公式單處)
+- [x] 四個 session handler 包 timeout(含 session_start);非 GET 錯誤訊息「可能已送出,勿重試」
+- [x] 紅測試:503+Retry-After 卡重試 sleep → 17.24s 觸發 budget、乾淨錯誤、同 session 可續用(拔 wrapper 驗證過真紅:30.24s 普通 503)
+- [x] docs/API.md + SECURITY.md 補 deadline 語意
+- [ ] (加分)MCP 工具名凍結測試(未做,非必做)
 
 ## 收斂
-- [ ] CHANGELOG 1.7.0 + 版本號 + README 演進路徑
-- [ ] verify-rb 全流程 + 真站煙測證據
-- [ ] 專案記憶收斂(決策/成果/踩坑)
+- [x] CHANGELOG 1.7.0(安全預設變更獨立段落)+ 版本號 1.7.0 + README 演進路徑
+- [x] verify-rb 全流程(fmt/clippy/test 150 passed)+ release binary 真站煙測(MDN 蒸餾正常;raw README.md passthrough raw 2675 = output 2675 精確直出)
+- [x] 專案記憶收斂(決策/成果/踩坑)
+- [ ] PR merge 後:GitHub `workflow_dispatch` 跑一次 nightly-live 留 run 連結(R1 尾巴)

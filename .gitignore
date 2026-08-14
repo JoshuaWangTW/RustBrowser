@@ -19,3 +19,4 @@
 # Ad-hoc test artefacts
 /out*.md
 /stats*.txt
+target-smoke/
