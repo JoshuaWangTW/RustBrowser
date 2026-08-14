@@ -7,7 +7,7 @@
 - [x] `tests/live.rs`:5 支 `#[ignore]` 真站測試(canary/passthrough/MDN/docs.rs actions/docs.rs session)
 - [x] `.github/workflows/nightly-live.yml`:schedule+dispatch、失敗開 issue(去重)、無 PR trigger
 - [x] 本機 `cargo test --test live -- --ignored` 全綠(2026-08-14,5/5)
-- [ ] GitHub `workflow_dispatch` 一次全綠,留 run 連結(← 需 workflow 進 master,收斂階段做)
+- [x] GitHub `workflow_dispatch` 一次全綠:https://github.com/JoshuaWangTW/RustBrowser/actions/runs/31770525893(5 passed, 1.99s)
 
 > R1 落差(來源:R1 真站實跑):codex-manual.md 現回 `application/octet-stream`,不進 passthrough——
 > 已記 RB_FETCH_ISSUES.md(2026-08-14),回歸鎖改用 tag-pinned raw.githubusercontent README.md。
@@ -48,4 +48,4 @@
 - [x] CHANGELOG 1.7.0(安全預設變更獨立段落)+ 版本號 1.7.0 + README 演進路徑
 - [x] verify-rb 全流程(fmt/clippy/test 150 passed)+ release binary 真站煙測(MDN 蒸餾正常;raw README.md passthrough raw 2675 = output 2675 精確直出)
 - [x] 專案記憶收斂(決策/成果/踩坑)
-- [ ] PR merge 後:GitHub `workflow_dispatch` 跑一次 nightly-live 留 run 連結(R1 尾巴)
+- [x] PR #12 merged(2026-08-14)+ nightly-live workflow_dispatch 全綠:runs/31770525893
