@@ -1,0 +1,55 @@
+name: Nightly Live Regression
+
+# Runs the real-website regression tests in `tests/live.rs` against actual
+# target sites. This is deliberately NOT wired to `push`/`pull_request` and
+# NOT a required check: a flaky third-party site should never block a merge.
+# A failure here means either a real RB regression or a target site being
+# unreachable/changed, and either way we want a human to look — so on
+# failure this opens (or reuses) a `live-regression` issue rather than just
+# going red silently.
+on:
+  schedule:
+    # 18:00 UTC = 02:00 Asia/Taipei.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-regression:
+    name: Live site regression tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run live tests
+        id: live_tests
+        run: cargo test --test live -- --ignored --test-threads=2
+
+      - name: Open regression issue on failure
+        if: failure() && steps.live_tests.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Nightly live regression: $(date -u +%Y-%m-%d)"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" --label live-regression --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)
+          BODY=$(printf '`tests/live.rs` failed against real sites in the nightly run.\n\nRun: %s\n\nThis may be a real RustBrowser regression or a target site being unreachable/changed — check the run log before assuming either.' "$RUN_URL")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "${{ github.repository }}" --body "Reproduced again: $RUN_URL"
+          else
+            gh issue create --repo "${{ github.repository }}" --title "$TITLE" --label live-regression --body "$BODY"
+          fi

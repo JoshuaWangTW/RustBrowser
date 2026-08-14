@@ -78,6 +78,38 @@ pub enum SubmitOutcome {
     },
 }
 
+/// The computed outcome of a settle, not yet applied to the session. Produced
+/// by [`Session::prepare_settle`] (`&self`, may `await`) and applied by
+/// [`Session::commit_settle`] (`&mut self`, synchronous).
+struct Settled {
+    snapshot: Distilled,
+    final_url: String,
+    failure: Option<String>,
+    fallback: Option<String>,
+    pending_log: PendingLog,
+}
+
+/// A settle that failed before producing a [`Settled`] outcome (distill
+/// error). Still carries its log entries: the pre-refactor behaviour logs the
+/// failure even though no other session state changes.
+#[derive(Debug)]
+struct SettleFailure {
+    error: anyhow::Error,
+    pending_log: PendingLog,
+}
+
+/// Operation-log entries computed during [`Session::prepare_settle`], applied
+/// to the session in one shot by [`Session::commit_settle`] /
+/// [`Session::commit_pending_log`].
+#[derive(Debug, Default)]
+struct PendingLog(Vec<OpLogEntry>);
+
+impl PendingLog {
+    fn push(&mut self, entry: OpLogEntry) {
+        self.0.push(entry);
+    }
+}
+
 impl Session {
     /// Start a session. The given options seed every snapshot; cookies persist
     /// across requests and the action tree is always extracted.
@@ -247,8 +279,16 @@ impl Session {
                 return Err(e);
             }
         };
-        self.settle("submit_form", &form.action, 1, result, false)
-            .await?;
+        match self
+            .prepare_settle("submit_form", &form.action, 1, result, false)
+            .await
+        {
+            Ok(settled) => self.commit_settle(settled),
+            Err(failure) => {
+                self.commit_pending_log(failure.pending_log);
+                return Err(failure.error);
+            }
+        }
         Ok(SubmitOutcome::Submitted)
     }
 
@@ -281,7 +321,16 @@ impl Session {
                         continue;
                     }
                     // Keep this result (idempotent step: the broker may escalate).
-                    self.settle(op, &target, attempt + 1, result, true).await?;
+                    match self
+                        .prepare_settle(op, &target, attempt + 1, result, true)
+                        .await
+                    {
+                        Ok(settled) => self.commit_settle(settled),
+                        Err(failure) => {
+                            self.commit_pending_log(failure.pending_log);
+                            return Err(failure.error);
+                        }
+                    }
                     return self.snapshot_ref();
                 }
                 Err(e) => {
@@ -311,34 +360,44 @@ impl Session {
         }
     }
 
-    /// Keep a settled fetch result: distill it into the snapshot (atomic — a
-    /// distill failure leaves prior state intact), let the Chrome Fallback
-    /// Broker escalate once when RB-only extraction looks insufficient, verify,
-    /// commit the navigation to history, and log the outcome. Shared by the
-    /// idempotent retry loop and the single-attempt confirmed non-GET submit —
-    /// the latter passes `allow_fallback = false`, because a POST's result page
-    /// must never be re-fetched by a browser.
-    async fn settle(
-        &mut self,
+    /// Compute the outcome of settling a fetch result: distill it into a
+    /// snapshot, let the Chrome Fallback Broker escalate once when RB-only
+    /// extraction looks insufficient, and verify — all without touching
+    /// session state. This is the only place a settle `await`s (the fallback
+    /// render), and it takes `&self` so the compiler guarantees nothing here
+    /// can mutate the session while that await is in flight: if the caller's
+    /// future is cancelled mid-computation, the session is simply left as it
+    /// was before the call. [`Self::commit_settle`] applies the result.
+    ///
+    /// Shared by the idempotent retry loop and the single-attempt confirmed
+    /// non-GET submit — the latter passes `allow_fallback = false`, because a
+    /// POST's result page must never be re-fetched by a browser.
+    async fn prepare_settle(
+        &self,
         op: &str,
         target: &str,
         attempt: usize,
         result: FetchResult,
         allow_fallback: bool,
-    ) -> Result<()> {
+    ) -> Result<Settled, SettleFailure> {
         let status = result.status;
+        let mut pending_log = PendingLog::default();
+
         let mut snap = match self.distill_result(&result) {
             Ok(s) => s,
             Err(e) => {
-                self.log_attempt(
+                pending_log.push(self.pending_log_entry(
                     op,
                     target,
                     Some(status),
                     attempt,
                     "distill_failed",
                     Some(short_err(&e)),
-                );
-                return Err(e);
+                ));
+                return Err(SettleFailure {
+                    error: e,
+                    pending_log,
+                });
             }
         };
 
@@ -347,9 +406,9 @@ impl Session {
         // is re-distilled through the same token-lean pipeline, so the caller
         // still gets compressed content + action tree — never a raw DOM. A
         // failed render is non-fatal: the HTTP snapshot stands.
-        self.last_fallback = None;
+        let mut fallback = None;
         if allow_fallback && let Some(reason) = self.fallback_decision(&snap, &result.html) {
-            self.last_fallback = Some(reason.label().to_string());
+            fallback = Some(reason.label().to_string());
             match self.render_fallback(&result.final_url).await {
                 Ok(rendered) => {
                     let rendered_result = FetchResult {
@@ -365,50 +424,67 @@ impl Session {
                                 d.used_headless = true;
                             }
                             snap = rendered_snap;
-                            self.log_attempt(
+                            pending_log.push(self.pending_log_entry(
                                 op,
                                 target,
                                 Some(status),
                                 attempt,
                                 "chrome_fallback",
                                 Some(reason.label().to_string()),
-                            );
+                            ));
                         }
-                        Err(e) => self.log_attempt(
+                        Err(e) => pending_log.push(self.pending_log_entry(
                             op,
                             target,
                             Some(status),
                             attempt,
                             "chrome_fallback_failed",
                             Some(short_err(&e)),
-                        ),
+                        )),
                     }
                 }
-                Err(e) => self.log_attempt(
+                Err(e) => pending_log.push(self.pending_log_entry(
                     op,
                     target,
                     Some(status),
                     attempt,
                     "chrome_fallback_failed",
                     Some(short_err(&e)),
-                ),
+                )),
             }
         }
 
         let failure = planner::verify(&snap);
-        self.last_failure = failure.clone();
-        self.current_url = Some(result.final_url);
-        self.last_snapshot = Some(snap);
-        self.commit_navigation();
-        self.log_attempt(
+        pending_log.push(self.pending_log_entry(
             op,
             target,
             Some(status),
             attempt,
             outcome_label(&failure),
+            failure.clone(),
+        ));
+
+        Ok(Settled {
+            snapshot: snap,
+            final_url: result.final_url,
             failure,
-        );
-        Ok(())
+            fallback,
+            pending_log,
+        })
+    }
+
+    /// Commit a computed [`Settled`] outcome: purely synchronous, no `await`,
+    /// so once called it cannot be interrupted partway through. The five
+    /// session fields that describe "where we are" — `current_url`,
+    /// `last_snapshot`, `redirect_history`, `last_failure`, `last_fallback` —
+    /// change together here and nowhere else.
+    fn commit_settle(&mut self, s: Settled) {
+        self.last_fallback = s.fallback;
+        self.last_failure = s.failure;
+        self.current_url = Some(s.final_url);
+        self.last_snapshot = Some(s.snapshot);
+        self.commit_navigation();
+        self.commit_pending_log(s.pending_log);
     }
 
     /// Distill a fetch result into a snapshot. Pure with respect to session
@@ -468,7 +544,23 @@ impl Session {
         outcome: &str,
         failure_reason: Option<String>,
     ) {
-        self.log.push(OpLogEntry {
+        let entry = self.pending_log_entry(op, target, status, attempt, outcome, failure_reason);
+        self.log.push(entry);
+        self.trim_log();
+    }
+
+    /// Build a log entry without mutating the session — used by
+    /// [`Self::prepare_settle`], which only holds `&self`.
+    fn pending_log_entry(
+        &self,
+        op: &str,
+        target: &str,
+        status: Option<u16>,
+        attempt: usize,
+        outcome: &str,
+        failure_reason: Option<String>,
+    ) -> OpLogEntry {
+        OpLogEntry {
             step: self.step,
             op: op.to_string(),
             target: target.to_string(),
@@ -476,7 +568,18 @@ impl Session {
             attempt,
             outcome: outcome.to_string(),
             failure_reason,
-        });
+        }
+    }
+
+    /// Append log entries computed by [`Self::prepare_settle`] (used both on
+    /// the success and the failure path, so a failed settle still leaves its
+    /// diagnostic trail — matching the pre-refactor behaviour).
+    fn commit_pending_log(&mut self, pending: PendingLog) {
+        self.log.extend(pending.0);
+        self.trim_log();
+    }
+
+    fn trim_log(&mut self) {
         if self.log.len() > MAX_LOG_ENTRIES {
             let drop = self.log.len() - MAX_LOG_ENTRIES;
             self.log.drain(0..drop);
@@ -631,5 +734,131 @@ mod tests {
         let opts = DistillOptions::default();
         let s = Session::new(opts).unwrap().with_max_action_retries(99);
         assert_eq!(s.max_action_retries, MAX_ACTION_RETRIES_CAP);
+    }
+
+    /// The five fields that describe "where the session is": `current_url`,
+    /// `last_snapshot` (as its markdown), `redirect_history`, `last_failure`,
+    /// `last_fallback`.
+    type SessionState = (
+        Option<String>,
+        Option<String>,
+        Vec<String>,
+        Option<String>,
+        Option<String>,
+    );
+
+    /// Snapshot of [`SessionState`] — checked before and after
+    /// `prepare_settle` to prove it left them untouched.
+    fn state_tuple(s: &Session) -> SessionState {
+        (
+            s.current_url.clone(),
+            s.last_snapshot.as_ref().map(|d| d.markdown.clone()),
+            s.redirect_history.clone(),
+            s.last_failure.clone(),
+            s.last_fallback.clone(),
+        )
+    }
+
+    fn fetch_result(html: &str) -> FetchResult {
+        FetchResult {
+            final_url: "https://example.com/page".into(),
+            status: 200,
+            content_type: Some("text/html".into()),
+            html: html.to_string(),
+            raw_bytes: html.len(),
+        }
+    }
+
+    #[tokio::test]
+    async fn settle_computation_does_not_mutate_session() {
+        let opts = DistillOptions {
+            allow_local: true,
+            js_mode: JsMode::Off,
+            ..Default::default()
+        };
+        let mut s = Session::new(opts).unwrap();
+        // Give the session some baseline state to prove untouched.
+        s.current_url = Some("https://example.com/prior".into());
+        s.redirect_history.push("https://example.com/prior".into());
+
+        let before = state_tuple(&s);
+        let html = "<html><body><h1>Title</h1><p>Enough body text for a clean snapshot here.</p></body></html>";
+        let settled = s
+            .prepare_settle(
+                "observe",
+                "https://example.com/page",
+                1,
+                fetch_result(html),
+                true,
+            )
+            .await
+            .expect("prepare_settle should succeed");
+        let after = state_tuple(&s);
+
+        assert_eq!(
+            before, after,
+            "prepare_settle must not mutate session state"
+        );
+
+        // Sanity: the computed outcome is the one we'd expect to commit.
+        assert_eq!(settled.final_url, "https://example.com/page");
+        assert!(settled.failure.is_none());
+
+        // Committing it now does change state.
+        s.commit_settle(settled);
+        assert_eq!(s.current_url().unwrap(), "https://example.com/page");
+    }
+
+    #[tokio::test]
+    async fn cancelled_step_leaves_session_consistent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        "<html><body><h1>Home</h1><p>Enough body text for a clean snapshot.</p></body></html>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .set_body_string(
+                        "<html><body><h1>Slow</h1><p>Enough body text for a clean snapshot.</p></body></html>",
+                    )
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = DistillOptions {
+            allow_local: true,
+            js_mode: JsMode::Off,
+            ..Default::default()
+        };
+        let mut s = Session::new(opts).unwrap();
+        s.observe(&format!("{}/", server.uri())).await.unwrap();
+        let before = state_tuple(&s);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            s.observe(&format!("{}/slow", server.uri())),
+        )
+        .await;
+        assert!(result.is_err(), "the slow request must time out");
+
+        let after = state_tuple(&s);
+        assert_eq!(
+            before, after,
+            "a cancelled step must leave the session exactly as it was"
+        );
     }
 }

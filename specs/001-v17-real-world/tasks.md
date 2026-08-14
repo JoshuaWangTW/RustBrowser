@@ -4,17 +4,21 @@
 > 完成定義與技術細節見 [plan.md](plan.md)。
 
 ## R1 — Nightly 真站 CI(可與 R2/R3 並行)
-- [ ] `tests/live.rs`:5 支 `#[ignore]` 真站測試(canary/codex-manual/MDN/docs.rs actions/docs.rs session)
-- [ ] `.github/workflows/nightly-live.yml`:schedule+dispatch、失敗開 issue(去重)、無 PR trigger
-- [ ] 本機 `cargo test --test live -- --ignored` 全綠
-- [ ] GitHub `workflow_dispatch` 一次全綠,留 run 連結
+- [x] `tests/live.rs`:5 支 `#[ignore]` 真站測試(canary/passthrough/MDN/docs.rs actions/docs.rs session)
+- [x] `.github/workflows/nightly-live.yml`:schedule+dispatch、失敗開 issue(去重)、無 PR trigger
+- [x] 本機 `cargo test --test live -- --ignored` 全綠(2026-08-14,5/5)
+- [ ] GitHub `workflow_dispatch` 一次全綠,留 run 連結(← 需 workflow 進 master,收斂階段做)
+
+> R1 落差(來源:R1 真站實跑):codex-manual.md 現回 `application/octet-stream`,不進 passthrough——
+> 已記 RB_FETCH_ISSUES.md(2026-08-14),回歸鎖改用 tag-pinned raw.githubusercontent README.md。
+> 潛在後續(未排程):extension sniff(`.md`+octet-stream → passthrough),需單獨裁決。
 
 ## R2 — settle 原子性重構(可與 R1/R3 並行)
-- [ ] `prepare_settle(&self)` / `commit_settle(&mut self)` / `Settled` / `SettleFailure`
-- [ ] 測試 `settle_computation_does_not_mutate_session`
-- [ ] 測試 `cancelled_step_leaves_session_consistent`(wiremock delay + timeout cancel)
-- [ ] 測試釘住裁決語意:`fallback_reason` 有值必伴隨 `chrome_fallback`/`chrome_fallback_failed` log
-- [ ] 既有測試全綠(零行為變更證明)
+- [x] `prepare_settle(&self)` / `commit_settle(&mut self)` / `Settled` / `SettleFailure`
+- [x] 測試 `settle_computation_does_not_mutate_session`
+- [x] 測試 `cancelled_step_leaves_session_consistent`(wiremock delay + timeout cancel)
+- [x] 測試釘住裁決語意:`fallback_reason_is_always_backed_by_a_log_entry`
+- [x] 既有測試全綠(2026-08-14 fmt/clippy/test 全綠,零行為變更)
 
 ## R3 — cookie 讀取(可與 R1/R2 並行)
 - [ ] 紅測試 `session_exposes_cookies_for_current_origin`(含 cross-origin 回 None)
