@@ -21,8 +21,8 @@
 - [x] 既有測試全綠(2026-08-14 fmt/clippy/test 全綠,零行為變更)
 
 ## R3 — cookie 讀取(可與 R1/R2 並行)
-- [ ] 紅測試 `session_exposes_cookies_for_current_origin`(含 cross-origin 回 None)
-- [ ] `Fetcher` 改 `cookie_provider(Arc<Jar>)` + `cookie_header_for`
+- [x] 紅測試 `session_exposes_cookies_for_current_origin`(含 cross-origin 回 None;在 src/session.rs #[cfg(test)],因 pub(crate) 對外部 test crate 不可見)
+- [x] `Fetcher` 改 `cookie_provider(Arc<Jar>)` + `cookie_header_for`(暫 #[allow(dead_code)],R4 接線後移除)
 
 ## R4 — CDP cookie render + 接線 + 安全文件(依賴 R2、R3)
 - [ ] `CdpRender` + `render_html_cdp_with`(既有 API 保留為包裝)

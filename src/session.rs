@@ -861,4 +861,46 @@ mod tests {
             "a cancelled step must leave the session exactly as it was"
         );
     }
+
+    #[tokio::test]
+    async fn session_exposes_cookies_for_current_origin() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/html")
+                    .insert_header("Set-Cookie", "sid=abc; Path=/")
+                    .set_body_string(
+                        "<html><body><h1>Home</h1><p>Enough body text for a clean snapshot.</p></body></html>",
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let opts = DistillOptions {
+            allow_local: true,
+            js_mode: JsMode::Off,
+            ..Default::default()
+        };
+        let mut s = Session::new(opts).unwrap();
+        let origin = format!("{}/", server.uri());
+        s.observe(&origin).await.unwrap();
+
+        assert_eq!(
+            s.fetcher.cookie_header_for(&origin).as_deref(),
+            Some("sid=abc"),
+            "session should read back the cookie it just received"
+        );
+
+        // Cross-origin scope lock: a different origin must never see it.
+        assert_eq!(
+            s.fetcher.cookie_header_for("https://evil.example.com/"),
+            None,
+            "cookies must not leak across origins"
+        );
+    }
 }

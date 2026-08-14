@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use encoding_rs::{Encoding, UTF_8};
+use reqwest::cookie::{CookieStore, Jar};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -111,30 +112,43 @@ pub struct Fetcher {
     client: reqwest::Client,
     opts: FetchOptions,
     gate: Arc<HostGate>,
+    /// Present when `opts.cookie_store` is on; lets a session read back the
+    /// cookies it has received for a given origin (see `cookie_header_for`).
+    /// Not yet wired into production code — R4 will feed this to the Chrome
+    /// Fallback Broker.
+    #[allow(dead_code)]
+    cookie_jar: Option<Arc<Jar>>,
     #[cfg(feature = "robots")]
     robots: Arc<crate::robots::RobotsCache>,
 }
 
 impl Fetcher {
     pub fn new(opts: FetchOptions) -> Result<Self> {
-        let client = reqwest::Client::builder()
+        // A custom jar (rather than the built-in `.cookie_store(true)`) lets a
+        // session read cookies back out via `cookie_header_for` — needed to
+        // seed the Chrome Fallback Broker's isolated render with the same
+        // cookies. Stateless fetches (`cookie_store: false`) get no provider,
+        // matching the old no-jar behaviour.
+        let cookie_jar = opts.cookie_store.then(|| Arc::new(Jar::default()));
+
+        let mut builder = reqwest::Client::builder()
             .user_agent(&opts.user_agent)
             .timeout(opts.timeout)
             .gzip(true)
             .brotli(true)
             .deflate(true)
             .redirect(reqwest::redirect::Policy::none())
-            // Persist cookies across a session's requests when asked.
-            .cookie_store(opts.cookie_store)
             // Resolve + screen IPs at the connection layer so reqwest dials the
             // exact addresses we validated — no separate pre-flight lookup that a
             // rebinding/low-TTL DNS could diverge from. Set once on the shared
             // client, so it applies to every request without breaking pooling.
             .dns_resolver(Arc::new(SafeResolver {
                 allow_local: opts.allow_local,
-            }))
-            .build()
-            .context("building HTTP client")?;
+            }));
+        if let Some(jar) = &cookie_jar {
+            builder = builder.cookie_provider(jar.clone());
+        }
+        let client = builder.build().context("building HTTP client")?;
 
         let gate = Arc::new(HostGate::new(
             opts.per_host_concurrency,
@@ -145,9 +159,31 @@ impl Fetcher {
             client,
             opts,
             gate,
+            cookie_jar,
             #[cfg(feature = "robots")]
             robots: Arc::new(crate::robots::RobotsCache::new()),
         })
+    }
+
+    /// The `Cookie:` header value this fetcher currently holds for `url`'s
+    /// origin (`name=value; name2=value2`), or `None` if cookies aren't
+    /// enabled for this fetcher or none are set for that origin. Different
+    /// origins never see each other's cookies — `Jar::cookies` scopes by URL.
+    ///
+    /// Used to hand the Chrome Fallback Broker's isolated render the same
+    /// cookies the session already has for the URL it's re-rendering; not a
+    /// general-purpose cookie export. `Jar::cookies` only yields `name=value`
+    /// pairs (no Secure/HttpOnly flags or expiry), so this is unsuitable for
+    /// anything resembling persistence.
+    ///
+    /// Not yet called from production code — R4 will feed this to the Chrome
+    /// Fallback Broker.
+    #[allow(dead_code)]
+    pub(crate) fn cookie_header_for(&self, url: &str) -> Option<String> {
+        let jar = self.cookie_jar.as_ref()?;
+        let parsed = Url::parse(url).ok()?;
+        let value = jar.cookies(&parsed)?;
+        value.to_str().ok().map(str::to_string)
     }
 
     /// Fetch a URL and return its decoded body. Each actual request hop applies,
