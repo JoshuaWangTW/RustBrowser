@@ -204,6 +204,28 @@ impl Session {
         self
     }
 
+    /// Wall-clock deadline a single session step (`observe`/`follow`/
+    /// `submit_form`, including `session_start`'s opening observe) should be
+    /// bounded to. Mirrors the MCP layer's `handler_budget`:
+    /// `(max_action_retries + 1) * opts.timeout`, maxed with the fallback
+    /// render's `js_wait`, plus a 15s margin for the same Chrome-startup /
+    /// synchronous-extraction slack `render.rs` already budgets for.
+    /// Recomputed from the current `max_action_retries`/`opts` rather than
+    /// cached, so it stays correct across `with_max_action_retries`.
+    pub fn step_budget(&self) -> Duration {
+        let attempts = (self.max_action_retries as u64).saturating_add(1);
+        let fetch_worst_case =
+            Duration::from_secs(self.opts.timeout.as_secs().saturating_mul(attempts));
+        let render_wait = self
+            .opts
+            .js_wait
+            .map(Duration::from_millis)
+            .unwrap_or_default();
+        fetch_worst_case
+            .max(render_wait)
+            .saturating_add(Duration::from_secs(15))
+    }
+
     pub fn current_url(&self) -> Option<&str> {
         self.current_url.as_deref()
     }

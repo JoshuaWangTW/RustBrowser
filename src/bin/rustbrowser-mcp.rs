@@ -823,9 +823,21 @@ impl RustBrowserServer {
         if let Some(n) = p.max_action_retries {
             session = session.with_max_action_retries(n);
         }
-        session.observe(&p.url).await.map_err(|e| {
-            rmcp::ErrorData::internal_error(format!("session start failed: {e}"), None)
-        })?;
+        let budget = session.step_budget();
+        match tokio::time::timeout(budget, session.observe(&p.url)).await {
+            Ok(r) => r.map_err(|e| {
+                rmcp::ErrorData::internal_error(format!("session start failed: {e}"), None)
+            })?,
+            Err(_) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!(
+                        "session_start exceeded time budget of {}s",
+                        budget.as_secs()
+                    ),
+                    None,
+                ));
+            }
+        };
         let id = Self::next_session_id();
         let view = session_view(&id, &session)?;
         self.insert_session(id, session)?;
@@ -841,10 +853,23 @@ impl RustBrowserServer {
     ) -> Result<String, rmcp::ErrorData> {
         let shared = self.lookup_session(&p.session_id)?;
         let mut session = shared.lock().await;
-        session
-            .observe(&p.url)
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None))?;
+        let budget = session.step_budget();
+        match tokio::time::timeout(budget, session.observe(&p.url)).await {
+            Ok(r) => {
+                r.map_err(|e| {
+                    rmcp::ErrorData::internal_error(format!("observe failed: {e}"), None)
+                })?;
+            }
+            Err(_) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!(
+                        "session_observe exceeded time budget of {}s; the session is unchanged and still usable",
+                        budget.as_secs()
+                    ),
+                    None,
+                ));
+            }
+        }
         session_view(&p.session_id, &session)
     }
 
@@ -857,10 +882,23 @@ impl RustBrowserServer {
     ) -> Result<String, rmcp::ErrorData> {
         let shared = self.lookup_session(&p.session_id)?;
         let mut session = shared.lock().await;
-        session
-            .follow(&p.action_id)
-            .await
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("follow failed: {e}"), None))?;
+        let budget = session.step_budget();
+        match tokio::time::timeout(budget, session.follow(&p.action_id)).await {
+            Ok(r) => {
+                r.map_err(|e| {
+                    rmcp::ErrorData::invalid_params(format!("follow failed: {e}"), None)
+                })?;
+            }
+            Err(_) => {
+                return Err(rmcp::ErrorData::internal_error(
+                    format!(
+                        "session_follow exceeded time budget of {}s; the session is unchanged and still usable",
+                        budget.as_secs()
+                    ),
+                    None,
+                ));
+            }
+        }
         session_view(&p.session_id, &session)
     }
 
@@ -889,11 +927,43 @@ impl RustBrowserServer {
     ) -> Result<String, rmcp::ErrorData> {
         let shared = self.lookup_session(&p.session_id)?;
         let mut session = shared.lock().await;
+        let confirm = p.confirm.unwrap_or(false);
+        // A confirmed non-GET submit actually sends the request; if the
+        // timeout below fires we've lost visibility into whether the server
+        // received it, so the error must warn against retrying it.
+        let is_confirmed_non_get = confirm
+            && session
+                .snapshot()
+                .and_then(|s| s.actions.as_ref())
+                .and_then(|a| a.forms.iter().find(|f| f.action_id == p.form_id))
+                .is_some_and(|f| !f.method.eq_ignore_ascii_case("GET"));
         let values: Vec<(String, String)> = p.values.into_iter().collect();
-        let outcome = session
-            .submit_form(&p.form_id, &values, p.confirm.unwrap_or(false))
-            .await
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("submit failed: {e}"), None))?;
+        let budget = session.step_budget();
+        let outcome = match tokio::time::timeout(
+            budget,
+            session.submit_form(&p.form_id, &values, confirm),
+        )
+        .await
+        {
+            Ok(r) => {
+                r.map_err(|e| rmcp::ErrorData::internal_error(format!("submit failed: {e}"), None))?
+            }
+            Err(_) => {
+                let msg = if is_confirmed_non_get {
+                    format!(
+                        "session_submit_form exceeded time budget of {}s; the request may have \
+                         been sent, RB did not receive a result — do NOT retry",
+                        budget.as_secs()
+                    )
+                } else {
+                    format!(
+                        "session_submit_form exceeded time budget of {}s; the session is unchanged and still usable",
+                        budget.as_secs()
+                    )
+                };
+                return Err(rmcp::ErrorData::internal_error(msg, None));
+            }
+        };
         match outcome {
             SubmitOutcome::Submitted => session_view(&p.session_id, &session),
             SubmitOutcome::NeedsConfirmation {
@@ -1158,6 +1228,94 @@ mod tests {
             .await
             .expect("server must still serve requests after a prior timeout");
         assert!(out.contains("ok"), "unexpected output: {out}");
+    }
+
+    #[tokio::test]
+    async fn session_observe_handler_times_out_cleanly_and_session_stays_usable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fast"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                b"<html><body><p>fast page</p></body></html>".to_vec(),
+                "text/html",
+            ))
+            .mount(&mock)
+            .await;
+        // Always 503 with a `Retry-After` far bigger than the session's
+        // step_budget. The retry loop's sleep (honouring `Retry-After`) is not
+        // bounded by `timeout_secs` at all — same technique as
+        // `fetch_url_handler_times_out_cleanly_and_server_stays_usable` above.
+        Mock::given(method("GET"))
+            .and(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "30")
+                    .set_body_raw(b"down".to_vec(), "text/plain"),
+            )
+            .mount(&mock)
+            .await;
+
+        let server = RustBrowserServer::new();
+        let start_params: SessionStartParams = serde_json::from_value(json!({
+            "url": format!("{}/fast", mock.uri()),
+            "timeout_secs": 1,
+            "max_action_retries": 1,
+            "allow_local": true,
+        }))
+        .expect("valid SessionStartParams");
+        let start_out = server
+            .session_start(Parameters(start_params))
+            .await
+            .expect("session_start against a fast page must succeed");
+        let start_view: serde_json::Value =
+            serde_json::from_str(&start_out).expect("session_start returns JSON");
+        let session_id = start_view["session_id"]
+            .as_str()
+            .expect("session_start view carries a session_id")
+            .to_string();
+
+        let observe_params: SessionObserveParams = serde_json::from_value(json!({
+            "session_id": session_id,
+            "url": format!("{}/slow", mock.uri()),
+        }))
+        .expect("valid SessionObserveParams");
+
+        let start = std::time::Instant::now();
+        let err = server
+            .session_observe(Parameters(observe_params))
+            .await
+            .expect_err("session_observe must time out rather than wait out the 30s delay");
+        let elapsed = start.elapsed();
+        assert!(
+            err.message.contains("time budget"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("still usable"),
+            "timeout error should reassure the session is still usable: {}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "handler did not time out before the natural delay would have completed: {elapsed:?}"
+        );
+
+        // The session must still work for a subsequent observe on a fast page —
+        // the dropped, mid-request future must not have wedged the session.
+        let retry_params: SessionObserveParams = serde_json::from_value(json!({
+            "session_id": session_id,
+            "url": format!("{}/fast", mock.uri()),
+        }))
+        .expect("valid SessionObserveParams");
+        let out = server
+            .session_observe(Parameters(retry_params))
+            .await
+            .expect("session must still be usable after a prior step timeout");
+        assert!(out.contains("fast page"), "unexpected output: {out}");
     }
 
     /// Property names present in a generated JSON schema's `properties` object.

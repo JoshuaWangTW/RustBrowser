@@ -140,6 +140,20 @@ to one HTTP attempt; low-level fetch retries are disabled so this budget is not
 multiplied. Retries back off exponentially (with jitter) and honour the
 server's `Retry-After`. A non-GET submit is **never** auto-retried.
 
+Every session tool (`session_start`, `session_observe`, `session_follow`,
+`session_submit_form`) is bounded by a wall-clock step deadline (since 1.7):
+`(max_action_retries + 1) × timeout_secs`, maxed with `js_wait` if larger,
+plus a 15s margin. This is the same budget the standalone `fetch_url` /
+`observe_url` tools already enforce, extended to cover sessions —
+`session_start` previously had no upper bound at all. If a step exceeds its
+deadline, the tool call errors out instead of hanging; **the session itself
+is left unchanged and is still usable** for the next call, because nothing is
+committed to the session until a step fully settles. The one exception is a
+confirmed (`confirm=true`) non-GET `session_submit_form`: a timeout there
+means RB lost visibility into whether the request was received by the
+server, so the error explicitly says the request **may have already been
+sent — do not retry it** (RB itself never auto-retries in this case either).
+
 ## JSON output schema (`Distilled`)
 
 `--format json` (and MCP `format=json`) serialise this object. Optional fields

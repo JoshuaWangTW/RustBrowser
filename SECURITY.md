@@ -161,6 +161,16 @@ forms. The relevant safeguards:
   `fallback_reason` + `used_headless`). An anonymous session (no cookies for
   the URL) is unaffected. Set `RUSTBROWSER_FALLBACK_NO_COOKIES=1` to restore
   the pre-1.7 anonymous-only fallback behaviour.
+- **Every session step has a wall-clock deadline (v1.7)** — `session_start`,
+  `session_observe`, `session_follow`, and `session_submit_form` are all
+  bounded by the same time-budget wrapper `fetch_url`/`observe_url` already
+  used, closing the gap where `session_start` previously had no upper bound
+  at all and a stalled request/render could hang a caller indefinitely. A
+  timed-out step errors out cleanly and leaves the session state untouched
+  (nothing is committed mid-step). A timed-out **confirmed non-GET submit**
+  is the one case where the underlying request may genuinely have reached
+  the server before RB gave up waiting; its error says so explicitly and
+  tells the caller not to retry — RB does not auto-retry it either.
 
 ## Hardening checklist for operators
 
