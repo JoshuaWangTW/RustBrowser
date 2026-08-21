@@ -163,11 +163,16 @@ async fn live_session_follow_on_real_site() {
         .actions
         .as_ref()
         .expect("session snapshots always extract actions");
+    // Follow the stable "All Items" rustdoc link instead of links[0]: the first
+    // link is the site-chrome "Docs.rs" logo pointing at the homepage, whose
+    // distilled content varies with the live release feed and can dip under the
+    // js_app fallback threshold (flaked nightly 2026-08-19 / 2026-08-21).
     let link_id = actions
         .links
-        .first()
+        .iter()
+        .find(|l| l.href.ends_with("/all.html"))
         .map(|l| l.action_id.clone())
-        .expect("docs.rs page should expose at least one link");
+        .expect("docs.rs rustdoc page should expose an All Items link");
 
     let before_url = s
         .current_url()
