@@ -30,6 +30,13 @@ pub struct LoopView {
     /// Why the last step failed verification (HTTP error). `None` = looks OK.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
+    /// Which engine produced `recommended_next_actions`: `jev` (TypeSafe
+    /// System One, goal-driven) or `heuristic`. Present since 1.8.
+    pub planner: &'static str,
+    /// Why the Jev planner was skipped or failed this step (heuristics were
+    /// used instead). Absent when Jev answered or was never configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_note: Option<String>,
 }
 
 /// The current page state — the "where am I" half of the loop.
@@ -103,9 +110,14 @@ pub struct AvailableAction {
 /// A heuristic suggestion. A hint for the planner — never executed by RB itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct RecommendedAction {
+    /// A real `action_id` from `available_actions`; empty only for a Jev
+    /// `done` / `blocked` verdict (kind says which).
     pub action_id: String,
     pub kind: String,
     pub why: String,
+    /// Jev's calibrated confidence in this hint (0–1). Absent for heuristics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// One recorded operation in a session's debug log.
@@ -156,6 +168,8 @@ pub fn loop_view(
             available_actions: Vec::new(),
             recommended_next_actions: Vec::new(),
             failure_reason,
+            planner: "heuristic",
+            planner_note: None,
         };
     };
 
@@ -182,12 +196,14 @@ pub fn loop_view(
         available_actions,
         recommended_next_actions,
         failure_reason,
+        planner: "heuristic",
+        planner_note: None,
     }
 }
 
 /// Flatten the categorised action tree into one uniform list, preserving each
 /// element's stable `action_id`.
-fn flatten_actions(tree: &ActionTree) -> Vec<AvailableAction> {
+pub(crate) fn flatten_actions(tree: &ActionTree) -> Vec<AvailableAction> {
     let mut out = Vec::with_capacity(tree.len());
     for l in &tree.links {
         out.push(AvailableAction {
@@ -257,6 +273,7 @@ fn recommend(tree: &ActionTree) -> Vec<RecommendedAction> {
             action_id: f.action_id.clone(),
             kind: "form".to_string(),
             why: "search/filter form (GET) — submit it to query the site".to_string(),
+            confidence: None,
         });
     }
 
@@ -265,6 +282,7 @@ fn recommend(tree: &ActionTree) -> Vec<RecommendedAction> {
             action_id: l.action_id.clone(),
             kind: "link".to_string(),
             why: "looks like pagination / next — follow it to walk the list".to_string(),
+            confidence: None,
         });
     }
 
@@ -275,6 +293,7 @@ fn recommend(tree: &ActionTree) -> Vec<RecommendedAction> {
             action_id: l.action_id.clone(),
             kind: "link".to_string(),
             why: "primary link on the page — follow it to navigate".to_string(),
+            confidence: None,
         });
     }
 

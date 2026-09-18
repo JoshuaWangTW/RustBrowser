@@ -5,6 +5,29 @@ All notable changes to RustBrowser are documented here. The format is based on
 [Semantic Versioning](https://semver.org/) from `1.0.0` onward (see
 [Stability & versioning](README.md#穩定性與版本-stability--versioning)).
 
+## [1.8.0]
+
+**Jev planner** — the technique from `browser-use/jev-ultrafast` grafted onto
+RB's existing dynamic indexed action space. Hints only; RB still never
+executes anything on its own.
+
+### Added
+- **`session_start.goal`** — with a natural-language goal and
+  `TYPESAFE_API_KEY` in the server environment, every settled step asks
+  TypeSafe's Jev (System One) two typed questions in one request — *which
+  operation* (`follow` / `submit_form` / `done` / `blocked`, only those with
+  candidates) and *which target* (speculative fan-out over `action_id`s). The
+  answer replaces the heuristic `loop.recommended_next_actions` with one hint
+  carrying a calibrated `confidence`. Non-GET forms stay `dangerous`.
+- **`loop.planner`** (`jev` / `heuristic`) and **`loop.planner_note`** (why
+  Jev was skipped/failed this step). `RecommendedAction.confidence?`.
+- Env: `TYPESAFE_API_KEY`, `TYPESAFE_MODEL` (default `jev-latest`),
+  `TYPESAFE_ENDPOINT` (default `https://api.typesafe.ai/v1/systemone`).
+- Answers are validated like jev-ultrafast's `validate_choice` (offered id,
+  full sane distribution, argmax) — anything off = no hint, heuristics stand.
+
+All additive; no schema breaks.
+
 ## [1.7.0]
 
 **From the fixed suite to the real world** — the Browser-Use loop's promises

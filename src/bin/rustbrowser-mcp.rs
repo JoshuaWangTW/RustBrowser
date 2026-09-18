@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
+use rustbrowser::jev::JevConfig;
 use rustbrowser::session::{Session, SubmitOutcome};
 use rustbrowser::{DistillOptions, Distilled, JsMode, Profile, distill, distill_many};
 
@@ -358,6 +359,13 @@ struct SessionStartParams {
     /// Headless wait / virtual-time budget in milliseconds for fallback renders.
     #[serde(default)]
     js_wait: Option<u64>,
+    /// Natural-language goal for this session (e.g. "find the 2026 price list
+    /// PDF"). When set and the server has `TYPESAFE_API_KEY`, the Jev planner
+    /// (TypeSafe System One) ranks the next action after every step into
+    /// `loop.recommended_next_actions` with a `confidence`. Hints only: RB
+    /// never executes them, and non-GET forms stay dangerous.
+    #[serde(default)]
+    goal: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -811,7 +819,7 @@ impl RustBrowserServer {
     }
 
     #[tool(
-        description = "START a stateful browsing SESSION (Browser Use). Opens a URL and keeps a cookie jar, the current URL, a redirect history, and the page snapshot with its action tree. Returns a session_id plus that snapshot. Drive the session afterwards with session_observe / session_follow / session_submit_form using the action_ids in the snapshot. Cookies persist, so login and search flows work without a real browser."
+        description = "START a stateful browsing SESSION (Browser Use). Opens a URL and keeps a cookie jar, the current URL, a redirect history, and the page snapshot with its action tree. Returns a session_id plus that snapshot. Drive the session afterwards with session_observe / session_follow / session_submit_form using the action_ids in the snapshot. Cookies persist, so login and search flows work without a real browser. Pass `goal` to have the Jev planner (TypeSafe) rank the next action with a confidence after every step (needs TYPESAFE_API_KEY on the server)."
     )]
     async fn session_start(
         &self,
@@ -822,6 +830,17 @@ impl RustBrowserServer {
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         if let Some(n) = p.max_action_retries {
             session = session.with_max_action_retries(n);
+        }
+        if let Some(goal) = p.goal.as_deref().filter(|g| !g.trim().is_empty()) {
+            match JevConfig::from_env() {
+                Some(cfg) => session = session.with_jev(cfg, goal),
+                None => {
+                    return Err(rmcp::ErrorData::invalid_params(
+                        "goal requires TYPESAFE_API_KEY in the MCP server environment",
+                        None,
+                    ));
+                }
+            }
         }
         let budget = session.step_budget();
         match tokio::time::timeout(budget, session.observe(&p.url)).await {
