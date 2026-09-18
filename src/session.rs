@@ -30,7 +30,8 @@ use tokio::time::sleep;
 use crate::actions::FormAction;
 use crate::fallback::{self, FallbackReason};
 use crate::fetch::{self, FetchOptions, FetchResult, Fetcher, SubmitMethod};
-use crate::planner::{self, LoopView, OpLogEntry};
+use crate::jev::{self, JevConfig};
+use crate::planner::{self, LoopView, OpLogEntry, RecommendedAction};
 use crate::{DistillOptions, Distilled, JsMode, distill_html, render};
 
 /// Default extra attempts for an idempotent step whose verify failed.
@@ -106,6 +107,13 @@ pub struct Session {
     /// Why the Chrome Fallback Broker escalated the last settled step
     /// (`None` = RB-only extraction was enough).
     last_fallback: Option<String>,
+    /// Natural-language goal for the Jev planner; `None` = heuristics only.
+    goal: Option<String>,
+    jev: Option<JevConfig>,
+    /// Jev's hints for the current snapshot (empty = use heuristics).
+    jev_recs: Vec<RecommendedAction>,
+    /// Why Jev was not used for the current snapshot.
+    jev_note: Option<String>,
 }
 
 /// What happened when a form submit was requested.
@@ -194,7 +202,19 @@ impl Session {
             log: Vec::new(),
             step: 0,
             last_fallback: None,
+            goal: None,
+            jev: None,
+            jev_recs: Vec::new(),
+            jev_note: None,
         })
+    }
+
+    /// Let Jev (TypeSafe System One) rank the next action toward `goal` after
+    /// every settled step. Hints only — nothing is executed by RB.
+    pub fn with_jev(mut self, cfg: JevConfig, goal: impl Into<String>) -> Self {
+        self.jev = Some(cfg);
+        self.goal = Some(goal.into());
+        self
     }
 
     /// Set how many extra attempts an idempotent step gets when verification
@@ -269,7 +289,32 @@ impl Session {
             self.step,
         );
         view.state.fallback_reason = self.last_fallback.clone();
+        if !self.jev_recs.is_empty() {
+            view.recommended_next_actions = self.jev_recs.clone();
+            view.planner = "jev";
+        }
+        view.planner_note = self.jev_note.clone();
         view
+    }
+
+    /// Refresh Jev's hints for the snapshot just settled. Any failure is
+    /// non-fatal: the heuristics stand and the reason lands in `planner_note`.
+    async fn refresh_jev(&mut self) {
+        self.jev_recs.clear();
+        self.jev_note = None;
+        let (Some(cfg), Some(goal), Some(snap)) = (&self.jev, &self.goal, &self.last_snapshot)
+        else {
+            return;
+        };
+        let (recs, note) = match jev::recommend(cfg, goal, snap, &self.log).await {
+            Ok(recs) => (recs, None),
+            Err(e) => (
+                Vec::new(),
+                Some(format!("jev unavailable: {}", short_err(&e))),
+            ),
+        };
+        self.jev_recs = recs;
+        self.jev_note = note;
     }
 
     /// Fetch `url` and make it the current snapshot (idempotent: verified +
@@ -349,7 +394,10 @@ impl Session {
             .prepare_settle("submit_form", &form.action, 1, result, false)
             .await
         {
-            Ok(settled) => self.commit_settle(settled),
+            Ok(settled) => {
+                self.commit_settle(settled);
+                self.refresh_jev().await;
+            }
             Err(failure) => {
                 self.commit_pending_log(failure.pending_log);
                 return Err(failure.error);
@@ -391,7 +439,10 @@ impl Session {
                         .prepare_settle(op, &target, attempt + 1, result, true)
                         .await
                     {
-                        Ok(settled) => self.commit_settle(settled),
+                        Ok(settled) => {
+                            self.commit_settle(settled);
+                            self.refresh_jev().await;
+                        }
                         Err(failure) => {
                             self.commit_pending_log(failure.pending_log);
                             return Err(failure.error);

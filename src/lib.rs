@@ -11,6 +11,7 @@ pub mod convert;
 pub mod extract;
 pub mod fallback;
 pub mod fetch;
+pub mod jev;
 pub mod planner;
 pub mod render;
 #[cfg(feature = "robots")]

@@ -110,7 +110,9 @@ it **also** carries an Action-Loop `loop` object and a debug `operation_log`
 
 - `loop.state` — `{url?, status, title, excerpt?, content_chars, action_count, low_content, used_headless, steps_taken, fallback_reason?}`. `fallback_reason` (since 1.4) says why the Chrome Fallback Broker escalated the last step (`challenge`, `js_app`, `no_actions`, `forced`); absent = RB-only extraction was enough.
 - `loop.available_actions` — array of `{action_id, kind, label, target?, method?, dangerous?, fields?}` (links/forms/buttons/downloads flattened). For forms, `fields` lists caller-fillable names only; hidden/default fields are still carried internally when submitting.
-- `loop.recommended_next_actions` — array of `{action_id, kind, why}` (heuristic hints, never auto-executed).
+- `loop.recommended_next_actions` — array of `{action_id, kind, why, confidence?}` (hints, never auto-executed). Heuristic by default; when the session was started with a `goal` and the server has `TYPESAFE_API_KEY`, the **Jev planner** (TypeSafe System One, since 1.8) ranks one operation + target per step and adds a calibrated `confidence` (0–1). A Jev `done`/`blocked` verdict has an empty `action_id` and `kind` = `done`/`blocked`.
+- `loop.planner` — `jev` or `heuristic` (since 1.8): which engine produced the hints.
+- `loop.planner_note` — string, present only when Jev was configured but skipped/failed this step (e.g. `jev unavailable: …`); heuristics were used.
 - `loop.failure_reason` — string, present only when the last step failed verification (an HTTP error status).
 - `operation_log` — recent array of `{step, op, target, status?, attempt, outcome, failure_reason?}`.
 
@@ -127,7 +129,7 @@ fallback render. See `SECURITY.md` for the full detail.
 
 | Tool | Params | Notes |
 |---|---|---|
-| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries`, `js` (`off`/`auto`/`always`, default `auto`), `js_wait` (ms) | Opens `url`, returns a `session_id` + first snapshot + `loop`. |
+| `session_start` | `url` (required); `profile`, `max_actions`, `timeout_secs`, `allow_local`, `respect_robots`, `max_action_retries`, `js` (`off`/`auto`/`always`, default `auto`), `js_wait` (ms), `goal` (string, since 1.8) | Opens `url`, returns a `session_id` + first snapshot + `loop`. With `goal`, the Jev planner ranks the next action after every step (requires `TYPESAFE_API_KEY` on the server, else `invalid_params`). Sends `{url, title, text ≤ 6000 chars, elements, recent ops}` to `api.typesafe.ai` per step. |
 | `session_observe` | `session_id`, `url` | Navigate the session to `url` (keeps cookies). |
 | `session_follow` | `session_id`, `action_id` | Follow a `link_*`/`download_*` from the last snapshot. |
 | `session_submit_form` | `session_id`, `form_id`, `values` (object), `confirm` (bool) | Submit a `form_*`, merging `values` over the form's defaults. GET submits immediately; a non-GET is **withheld unless `confirm=true`** (returns the session view plus `{needs_confirmation, would_submit}`). |

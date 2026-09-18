@@ -583,3 +583,69 @@ async fn fallback_reason_is_always_backed_by_a_log_entry() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Jev planner: with a goal, the session asks TypeSafe after each settled step
+/// and surfaces the chosen target (with confidence) instead of the heuristics.
+#[tokio::test]
+async fn jev_planner_ranks_next_action_and_falls_back_on_error() {
+    use rustbrowser::jev::JevConfig;
+    use wiremock::matchers::{body_string_contains as body_has, header_exists};
+
+    let site = MockServer::start().await;
+    home(&site).await;
+    let jev = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(header_exists("authorization"))
+        .and(body_has("\"goal\":\"search for bread\""))
+        .and(body_has("submit_form_target"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "answers": {
+                "operation": { "choice": "submit_form",
+                    "probabilities": { "follow": 0.1, "submit_form": 0.8, "done": 0.05, "blocked": 0.05 },
+                    "confidence": 0.9 },
+                "follow_target": { "choice": "link_0", "probabilities": { "link_0": 1.0 }, "confidence": 0.6 },
+                "submit_form_target": { "choice": "form_0",
+                    "probabilities": { "form_0": 0.95, "form_1": 0.05 }, "confidence": 0.85 }
+            }
+        })))
+        .expect(1)
+        .mount(&jev)
+        .await;
+
+    let cfg = JevConfig {
+        api_key: "test-key".into(),
+        model: "jev-latest".into(),
+        endpoint: format!("{}/v1/systemone", jev.uri()),
+    };
+    let mut s = Session::new(opts())
+        .unwrap()
+        .with_jev(cfg.clone(), "search for bread");
+    s.observe(&format!("{}/", site.uri())).await.unwrap();
+    let view = s.loop_view();
+    assert_eq!(view.planner, "jev");
+    assert!(view.planner_note.is_none());
+    let rec = &view.recommended_next_actions[0];
+    assert_eq!(rec.action_id, "form_0");
+    assert_eq!(rec.confidence, Some(0.85));
+    assert!(rec.why.starts_with("jev:"), "{}", rec.why);
+
+    // Jev down → heuristics stand and the note says why. Nothing else breaks.
+    let dead = JevConfig {
+        endpoint: "http://127.0.0.1:9/v1/systemone".into(),
+        ..cfg
+    };
+    let mut s = Session::new(opts())
+        .unwrap()
+        .with_jev(dead, "search for bread");
+    s.observe(&format!("{}/", site.uri())).await.unwrap();
+    let view = s.loop_view();
+    assert_eq!(view.planner, "heuristic");
+    assert!(
+        view.planner_note
+            .as_deref()
+            .unwrap()
+            .starts_with("jev unavailable")
+    );
+    assert_eq!(view.recommended_next_actions[0].action_id, "form_0");
+}
